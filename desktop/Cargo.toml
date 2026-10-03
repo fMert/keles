@@ -1,0 +1,33 @@
+[package]
+name = "keles-desktop"
+version = "0.2.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Keles HTML/WASM game in its own desktop window"
+repository = "https://github.com/fMert/keles"
+
+[dependencies]
+include_dir = "0.7.4"
+tao = "0.37.1"
+wry = "0.57.0"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+
+[package.metadata.deb]
+maintainer = "fMert <fmert@users.noreply.github.com>"
+copyright = "Keles contributors"
+license-file = ["../LICENSE", "0"]
+depends = "$auto, libwebkit2gtk-4.1-0 (>= 2.44.3)"
+section = "games"
+assets = [
+    ["target/release/keles-desktop", "usr/bin/keles", "755"],
+    ["keles.desktop", "usr/share/applications/keles.desktop", "644"],
+    ["../README.md", "usr/share/doc/keles-desktop/README.md", "644"],
+    ["LICENSE-MIT-Wry", "usr/share/doc/keles-desktop/LICENSE-MIT-Wry", "644"],
+    ["THIRD-PARTY-LICENSES.txt", "usr/share/doc/keles-desktop/THIRD-PARTY-LICENSES.txt", "644"],
+    ["../LICENSE-MIT-WebGL2Samples", "usr/share/doc/keles-desktop/LICENSE-MIT-WebGL2Samples", "644"],
+    ["../LICENSE-MIT-wasm-bindgen", "usr/share/doc/keles-desktop/LICENSE-MIT-wasm-bindgen", "644"],
+]

@@ -1808,9 +1808,9 @@ fn start() -> Result<(), JsValue> {
                 return;
             }
             if event.code() == "Space" && !event.repeat() {
-                event.prevent_default();
                 let mut game = key_game.borrow_mut();
                 if game.screen == Screen::Playing {
+                    event.prevent_default();
                     game.jump = pressed;
                 }
                 return;
@@ -1823,9 +1823,9 @@ fn start() -> Result<(), JsValue> {
                 _ => None,
             };
             if let Some(index) = index {
-                event.prevent_default();
                 let mut game = key_game.borrow_mut();
                 if game.screen == Screen::Playing {
+                    event.prevent_default();
                     game.keys[index] = pressed;
                 }
             }

@@ -1,5 +1,74 @@
 # Keles
 
+The desktop application runs the same HTML/Rust/WASM client in its own window.
+The HTML, WASM, generated loader and images are embedded in the executable;
+no browser tab, local HTTP server or game server process is needed. Single
+player works offline. For multiplayer, enter your remote server's `IP:port`
+or `wss://` address in **Play → Multiplayer** as before.
+
+Desktop downloads are on [GitHub Releases](https://github.com/fMert/keles/releases).
+The Linux amd64 `.deb` targets Debian 13 or a compatible newer distribution:
+install with `sudo apt install ./keles-desktop_0.2.0_amd64.deb`, then launch
+**Keles** from the application menu or run `keles`. APT installs the required
+GTK/WebKitGTK runtime dependencies. The Windows x64 executable is portable:
+double-click `keles-0.2.0-windows-x64.exe`. Windows 10/11 requires the
+[Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/),
+which is usually already installed. The executable includes the MSVC runtime.
+Keep the release's `LICENSE` and `THIRD-PARTY-LICENSES.txt` with the Windows
+executable when redistributing it. The Debian package includes these notices.
+
+Build the desktop client after rebuilding WASM from the project root:
+
+```sh
+wasm-pack build --target web --release
+# Linux build prerequisites (Debian/Ubuntu):
+sudo apt install build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libdbus-1-dev
+cargo run --locked --manifest-path desktop/Cargo.toml
+cargo test --locked --manifest-path desktop/Cargo.toml
+cargo install cargo-deb --locked
+cd desktop
+cargo deb --locked --output ../dist/keles-desktop_0.2.0_amd64.deb
+```
+
+On Windows, install Rust with the MSVC toolchain and Visual Studio C++ build
+tools, rebuild WASM as above, then build the portable executable:
+
+```sh
+cargo build --locked --release --manifest-path desktop/Cargo.toml --target x86_64-pc-windows-msvc --config 'target.x86_64-pc-windows-msvc.rustflags=["-C", "target-feature=+crt-static"]'
+```
+
+The result is `desktop/target/x86_64-pc-windows-msvc/release/keles-desktop.exe`.
+From Linux, the same command can use `cargo xwin build` after installing
+[cargo-xwin](https://github.com/rust-cross/cargo-xwin), Clang and LLD, and
+running `rustup target add x86_64-pc-windows-msvc`.
+WASM must be rebuilt **before** each desktop build so the embedded client is current.
+
+Desktop source borrowing (all from Wry v0.57.0, commit
+`792d0359ba6501a4fc360ece17de2ae42329a47c`, MIT):
+
+| Repository | Exact source | Adaptation |
+| --- | --- | --- |
+| [tauri-apps/wry](https://github.com/tauri-apps/wry) | [`examples/custom_protocol.rs`, `get_wry_response`, lines 73–101](https://github.com/tauri-apps/wry/blob/792d0359ba6501a4fc360ece17de2ae42329a47c/examples/custom_protocol.rs#L73) | Asset path, MIME and response handling; embedded bytes replace filesystem reads, missing paths return 404. |
+| [tauri-apps/wry](https://github.com/tauri-apps/wry) | [`examples/custom_protocol.rs`, `main`, lines 17–24 and 34–67](https://github.com/tauri-apps/wry/blob/792d0359ba6501a4fc360ece17de2ae42329a47c/examples/custom_protocol.rs#L17) | Native window, custom protocol, GTK integration and close event loop. |
+
+Wry meets the project quality bar: it is Tauri's production webview library,
+with over 1,000 commits, over 100 contributors, CI, maintained examples,
+documentation, issue triage and security audits. Both adaptations include
+source comments and `desktop/LICENSE-MIT-Wry`. Dependencies are used through
+their public APIs: [Tao](https://github.com/tauri-apps/tao) (Apache-2.0) is
+Tauri's maintained windowing library, with CI and over 100 contributors;
+[include_dir](https://github.com/Michael-F-Bryan/include_dir) (MIT) has existed
+since 2017, with over 200 commits, 14 contributors, tests and examples. No
+implementation snippets were copied from these two dependencies.
+
+Release 0.2.0 validation: the Linux application was run on a separate virtual
+display with Mesa software rendering. Both maps, WASD, mouse capture/look,
+shooting, pause, nickname entry, WebSocket connection to the existing local
+relay and team selection were checked. The embedded asset test and desktop
+Clippy checks passed. The Windows x64 MSVC build was cross-compiled and its
+PE/GUI format, system DLL imports and embedded HTML/WASM were checked; it has
+not been run on a Windows machine. The desktop package contains only the client.
+
 Build the browser game from the project root:
 
 ```sh

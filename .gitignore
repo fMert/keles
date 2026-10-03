@@ -2,3 +2,5 @@
 /server/target/
 /tools/convert/target/
 /pkg/
+/desktop/target/
+/dist/

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Keles
+Comment=Keles multiplayer FPS
+Exec=keles
+Terminal=false
+Categories=Game;ActionGame;
