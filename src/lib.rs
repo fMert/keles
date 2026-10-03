@@ -87,11 +87,26 @@ const SPRITE_VERTICES: [f32; 24] = [
 ];
 // Exact transparent cutouts in the supplied 1536x1024 four-view image:
 // front, back, left-facing, right-facing. Coordinates are [left, top, right, bottom).
+const GRAVITY: f32 = 20.0;
+const JUMP_SPEED: f32 = 6.0;
+const FIRE_COOLDOWN_MS: f64 = 500.0;
+const FALL_LIMIT: f32 = -20.0;
+
 const OPERATIVE_VIEWS: [[f32; 4]; 4] = [
     [30.0, 51.0, 375.0, 937.0],
     [412.0, 54.0, 745.0, 946.0],
     [747.0, 55.0, 1135.0, 953.0],
     [1167.0, 54.0, 1526.0, 951.0],
+];
+
+// Girls team uses the user-supplied 1448x1086 four-view image in the same
+// front/back/left/right order. Bounds are the four figure blobs detected by
+// connected-component analysis, matching how the boys views were cut.
+const GIRL_VIEWS: [[f32; 4]; 4] = [
+    [26.0, 67.0, 384.0, 991.0],
+    [392.0, 63.0, 744.0, 990.0],
+    [694.0, 73.0, 1074.0, 1004.0],
+    [1090.0, 76.0, 1431.0, 1008.0],
 ];
 
 // Minecraft Java's 0–200% slider maps to 0–1 before its cubic mouse curve.
@@ -113,10 +128,42 @@ enum Screen {
     Modes,
     MapSelect,
     Join,
+    Team,
     Playing,
     Paused,
+    Dead,
+    Result,
     SettingsMain,
     SettingsPaused,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Team {
+    Boys,
+    Girls,
+}
+
+impl Team {
+    fn as_str(self) -> &'static str {
+        match self {
+            Team::Boys => "boys",
+            Team::Girls => "girls",
+        }
+    }
+
+    fn color(self) -> &'static str {
+        match self {
+            Team::Boys => "#4a90ff",
+            Team::Girls => "#ff66cc",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Team::Boys => "Boys",
+            Team::Girls => "Girls",
+        }
+    }
 }
 
 struct RemotePlayer {
@@ -126,6 +173,7 @@ struct RemotePlayer {
     y: f32,
     yaw: f32,
     health: u8,
+    team: Team,
 }
 
 struct BloodEffect {
@@ -173,14 +221,18 @@ struct Game {
     sprite_program: WebGlProgram,
     sprite_vao: WebGlVertexArrayObject,
     operative_vaos: Vec<WebGlVertexArrayObject>,
+    girl_vaos: Vec<WebGlVertexArrayObject>,
     sprite_transform: WebGlUniformLocation,
     textures: [Option<WebGlTexture>; 3],
     operative_texture: Option<WebGlTexture>,
+    girl_texture: Option<WebGlTexture>,
     shot_at: f64,
     position: Vec3,
     yaw: f32,
     pitch: f32,
     keys: [bool; 4],
+    jump: bool,
+    vertical: f32,
     last_frame: f64,
     screen: Screen,
     map: Map,
@@ -200,6 +252,9 @@ struct Game {
     fps_hud: HtmlElement,
     fps_since: f64,
     fps_frames: u32,
+    score_hud: HtmlElement,
+    boys_score: HtmlElement,
+    girls_score: HtmlElement,
     health_hud: HtmlElement,
     health_label: HtmlElement,
     health_fill: HtmlElement,
@@ -207,6 +262,10 @@ struct Game {
     self_id: Option<u32>,
     socket: Option<WebSocket>,
     connected: bool,
+    joined: bool,
+    team: Option<Team>,
+    winner: Option<Team>,
+    result_deadline: f64,
     session: u32,
     last_sent: f64,
     remote: HashMap<u32, RemotePlayer>,
@@ -263,8 +322,28 @@ impl Game {
         self.blood.clear();
         self.local_hit_at = f64::NEG_INFINITY;
         self.connected = false;
+        self.joined = false;
+        self.team = None;
+        self.winner = None;
         self.self_id = None;
         self.hud.set_inner_text("");
+        self.refresh_score(0, 0);
+    }
+
+    // Paints the top scoreboard; the local team's name gets a "(you)" suffix.
+    fn refresh_score(&self, boys: u32, girls: u32) {
+        for (element, team, score) in [
+            (&self.boys_score, Team::Boys, boys),
+            (&self.girls_score, Team::Girls, girls),
+        ] {
+            let you = if self.team == Some(team) {
+                " (you)"
+            } else {
+                ""
+            };
+            element.set_inner_text(&format!("{}{}: {score}", team.label(), you));
+            let _ = element.style().set_property("color", team.color());
+        }
     }
 
     fn refresh_health(&self) {
@@ -282,8 +361,7 @@ impl Game {
             return;
         }
         if self.health == 0 {
-            self.hud
-                .set_inner_text("You died\nPress Escape for Main menu");
+            self.hud.set_inner_text("You are dead\nPress Respawn");
             return;
         }
         let mut names = self
@@ -306,6 +384,7 @@ impl Game {
     fn show_screen(&mut self, screen: Screen) {
         self.screen = screen;
         self.keys = [false; 4];
+        self.jump = false;
         if matches!(screen, Screen::Playing | Screen::Main) {
             self.status.set_inner_text("");
         }
@@ -322,13 +401,32 @@ impl Game {
             Screen::Modes => ("Choose mode", ["Multiplayer", "Single player", ""]),
             Screen::MapSelect => ("Choose map", ["Camel", "Test", "Back"]),
             Screen::Join => ("Multiplayer", ["Connect", "Back", ""]),
+            Screen::Team => ("Choose your team", ["Boys", "Girls", ""]),
             Screen::Paused => ("Paused", ["Resume", "Settings", "Main menu"]),
+            Screen::Dead => ("You died", ["Respawn", "", ""]),
+            Screen::Result => (
+                match (self.team, self.winner) {
+                    (Some(team), Some(winner)) if team == winner => "Victory",
+                    _ => "Defeat",
+                },
+                ["", "", ""],
+            ),
             Screen::SettingsMain | Screen::SettingsPaused => ("Settings", ["Back", "", ""]),
             Screen::Playing => ("", ["", "", ""]),
         };
         self.menu_title.set_inner_text(title);
         if matches!(screen, Screen::Modes | Screen::MapSelect) {
             self.status.set_inner_text("Press Escape to go back");
+        }
+        if screen == Screen::Team {
+            self.status
+                .set_inner_text("Pick a side. Boys and girls see different models.");
+        }
+        if screen == Screen::Dead {
+            self.status.set_inner_text("Waiting to respawn.");
+        }
+        if screen == Screen::Result {
+            self.status.set_inner_text("Restarting in 10");
         }
         for input in [&self.server_input, &self.nickname_input] {
             let _ = input.style().set_property(
@@ -347,7 +445,10 @@ impl Game {
                 Screen::Modes
                     | Screen::MapSelect
                     | Screen::Join
+                    | Screen::Team
                     | Screen::Paused
+                    | Screen::Dead
+                    | Screen::Result
                     | Screen::SettingsMain
                     | Screen::SettingsPaused
             ) {
@@ -364,14 +465,13 @@ impl Game {
                 "none"
             },
         );
+        let in_match = matches!(
+            screen,
+            Screen::Playing | Screen::Paused | Screen::SettingsPaused
+        );
         let _ = self.hud.style().set_property(
             "display",
-            if self.socket.is_some()
-                && matches!(
-                    screen,
-                    Screen::Playing | Screen::Paused | Screen::SettingsPaused
-                )
-            {
+            if self.socket.is_some() && (in_match || screen == Screen::Dead) {
                 "block"
             } else {
                 "none"
@@ -379,10 +479,17 @@ impl Game {
         );
         let _ = self.health_hud.style().set_property(
             "display",
-            if matches!(
-                screen,
-                Screen::Playing | Screen::Paused | Screen::SettingsPaused
-            ) {
+            if in_match || screen == Screen::Dead {
+                "block"
+            } else {
+                "none"
+            },
+        );
+        let _ = self.score_hud.style().set_property(
+            "display",
+            if self.socket.is_some()
+                && (in_match || matches!(screen, Screen::Dead | Screen::Result))
+            {
                 "block"
             } else {
                 "none"
@@ -435,6 +542,11 @@ impl Game {
 
         let dt = ((now - self.last_frame) / 1000.0).clamp(0.0, 0.05) as f32;
         self.last_frame = now;
+        if self.screen == Screen::Result {
+            let remaining = ((self.result_deadline - now) / 1000.0).ceil().max(0.0) as u32;
+            self.status
+                .set_inner_text(&format!("Restarting in {remaining}"));
+        }
         if matches!(
             self.screen,
             Screen::Main | Screen::Modes | Screen::MapSelect | Screen::Join | Screen::SettingsMain
@@ -447,17 +559,67 @@ impl Game {
         let right = Vec3::new(-forward.z, 0.0, forward.x);
         let movement = forward * (self.keys[0] as i32 - self.keys[2] as i32) as f32
             + right * (self.keys[3] as i32 - self.keys[1] as i32) as f32;
-        if self.screen == Screen::Playing && self.health > 0 && movement.length_squared() > 0.0 {
-            let step = movement.normalize() * 4.0 * dt;
-            let x = self.position.x + step.x;
-            if let Some(floor) = map::stand_height(self.map, x, self.position.z, self.position.y - 1.7, 0.28) {
-                self.position.x = x;
-                self.position.y = floor + 1.7;
+        if self.screen == Screen::Playing && self.health > 0 {
+            let radius = 0.28;
+            let feet = self.position.y - map::EYE_HEIGHT;
+            if movement.length_squared() > 0.0 {
+                let step = movement.normalize() * 4.0 * dt;
+                let x = self.position.x + step.x;
+                if !map::wall_blocked(self.map, x, self.position.z, feet, radius) {
+                    self.position.x = x;
+                }
+                let z = self.position.z + step.z;
+                if !map::wall_blocked(self.map, self.position.x, z, feet, radius) {
+                    self.position.z = z;
+                }
             }
-            let z = self.position.z + step.z;
-            if let Some(floor) = map::stand_height(self.map, self.position.x, z, self.position.y - 1.7, 0.28) {
-                self.position.z = z;
-                self.position.y = floor + 1.7;
+            let feet = self.position.y - map::EYE_HEIGHT;
+            if self.vertical == 0.0 {
+                if let Some(floor) = map::floor_at(
+                    self.map,
+                    self.position.x,
+                    self.position.z,
+                    feet,
+                    map::STEP_UP,
+                ) {
+                    if floor > feet {
+                        self.position.y = floor + map::EYE_HEIGHT;
+                    }
+                }
+            }
+            if self.jump {
+                if self.vertical == 0.0 {
+                    self.vertical = JUMP_SPEED;
+                }
+                self.jump = false;
+            }
+            self.vertical -= GRAVITY * dt;
+            let feet = self.position.y - map::EYE_HEIGHT;
+            let landing = self.position.y + self.vertical * dt - map::EYE_HEIGHT;
+            let floor = map::floor_at(
+                self.map,
+                self.position.x,
+                self.position.z,
+                feet,
+                map::STEP_UP,
+            );
+            if let Some(floor) = floor.filter(|floor| landing <= *floor) {
+                self.position.y = floor + map::EYE_HEIGHT;
+                self.vertical = 0.0;
+            } else {
+                self.position.y += self.vertical * dt;
+            }
+            if self.position.y < FALL_LIMIT {
+                self.position = if self.map == Map::Camel {
+                    Vec3::new(
+                        map::CAMEL_SPAWN[0],
+                        map::CAMEL_SPAWN[1] + map::EYE_HEIGHT,
+                        map::CAMEL_SPAWN[2],
+                    )
+                } else {
+                    Vec3::new(0.0, map::EYE_HEIGHT, 5.0)
+                };
+                self.vertical = 0.0;
             }
         }
         if self.screen == Screen::Playing && self.connected && now - self.last_sent >= 100.0 {
@@ -507,7 +669,12 @@ impl Game {
         }
         if self.map == Map::Camel {
             gl.bind_vertex_array(Some(&self.camel_vao));
-            gl.uniform_matrix4fv_with_f32_array(Some(&self.transform), false, &vp.to_cols_array());
+            let camel_vp = vp * Mat4::from_scale(Vec3::splat(map::CAMEL_SCALE));
+            gl.uniform_matrix4fv_with_f32_array(
+                Some(&self.transform),
+                false,
+                &camel_vp.to_cols_array(),
+            );
             for part in &self.camel_parts {
                 let texture = self.camel_textures[part.image].as_ref();
                 gl.uniform1i(Some(&self.texture_enabled), i32::from(texture.is_some()));
@@ -553,41 +720,48 @@ impl Game {
             }
         }
 
-        if let Some(texture) = &self.operative_texture {
-            let mut players = self
-                .remote
-                .values()
-                .filter(|player| player.health > 0)
-                .collect::<Vec<_>>();
-            players.sort_by(|a, b| {
-                let da = (a.x - self.position.x).powi(2) + (a.z - self.position.z).powi(2);
-                let db = (b.x - self.position.x).powi(2) + (b.z - self.position.z).powi(2);
-                db.total_cmp(&da)
-            });
-            gl.depth_mask(false);
-            gl.enable(Gl::BLEND);
-            gl.blend_func(Gl::SRC_ALPHA, Gl::ONE_MINUS_SRC_ALPHA);
-            gl.use_program(Some(&self.sprite_program));
+        let mut players = self
+            .remote
+            .values()
+            .filter(|player| player.health > 0)
+            .collect::<Vec<_>>();
+        players.sort_by(|a, b| {
+            let da = (a.x - self.position.x).powi(2) + (a.z - self.position.z).powi(2);
+            let db = (b.x - self.position.x).powi(2) + (b.z - self.position.z).powi(2);
+            db.total_cmp(&da)
+        });
+        gl.depth_mask(false);
+        gl.enable(Gl::BLEND);
+        gl.blend_func(Gl::SRC_ALPHA, Gl::ONE_MINUS_SRC_ALPHA);
+        gl.use_program(Some(&self.sprite_program));
+        for player in players {
+            let (texture, vaos, views) = match player.team {
+                Team::Boys => (
+                    &self.operative_texture,
+                    &self.operative_vaos,
+                    &OPERATIVE_VIEWS,
+                ),
+                Team::Girls => (&self.girl_texture, &self.girl_vaos, &GIRL_VIEWS),
+            };
+            let Some(texture) = texture else { continue };
+            let view_index = operative_view(player, self.position);
+            let crop = views[view_index];
+            let half_width = 0.95 * (crop[2] - crop[0]) / (crop[3] - crop[1]);
+            let facing_viewer = (self.position.x - player.x).atan2(self.position.z - player.z);
+            let model = Mat4::from_translation(Vec3::new(player.x, player.y + 0.95, player.z))
+                * Mat4::from_rotation_y(facing_viewer)
+                * Mat4::from_scale(Vec3::new(half_width, 0.95, 1.0));
             gl.bind_texture(Gl::TEXTURE_2D, Some(texture));
-            for player in players {
-                let view_index = operative_view(player, self.position);
-                let crop = OPERATIVE_VIEWS[view_index];
-                let half_width = 0.95 * (crop[2] - crop[0]) / (crop[3] - crop[1]);
-                let facing_viewer = (self.position.x - player.x).atan2(self.position.z - player.z);
-                let model = Mat4::from_translation(Vec3::new(player.x, player.y + 0.95, player.z))
-                    * Mat4::from_rotation_y(facing_viewer)
-                    * Mat4::from_scale(Vec3::new(half_width, 0.95, 1.0));
-                gl.bind_vertex_array(Some(&self.operative_vaos[view_index]));
-                gl.uniform_matrix4fv_with_f32_array(
-                    Some(&self.sprite_transform),
-                    false,
-                    &(vp * model).to_cols_array(),
-                );
-                gl.draw_arrays(Gl::TRIANGLES, 0, 6);
-            }
-            gl.disable(Gl::BLEND);
-            gl.depth_mask(true);
+            gl.bind_vertex_array(Some(&vaos[view_index]));
+            gl.uniform_matrix4fv_with_f32_array(
+                Some(&self.sprite_transform),
+                false,
+                &(vp * model).to_cols_array(),
+            );
+            gl.draw_arrays(Gl::TRIANGLES, 0, 6);
         }
+        gl.disable(Gl::BLEND);
+        gl.depth_mask(true);
 
         gl.disable(Gl::DEPTH_TEST);
         if self.blood_input.checked() && now - self.local_hit_at < 350.0 {
@@ -649,6 +823,27 @@ impl Game {
     }
 }
 
+fn send_join(game: &Rc<RefCell<Game>>) {
+    let mut game = game.borrow_mut();
+    let Some(team) = game.team else { return };
+    if game.joined {
+        return;
+    }
+    let Some(socket) = game.socket.clone() else {
+        return;
+    };
+    if socket.ready_state() != WebSocket::OPEN {
+        return;
+    }
+    let name = game.nickname_input.value().trim().to_owned();
+    if socket
+        .send_with_str(&format!("JOIN|{name}|{}", team.as_str()))
+        .is_ok()
+    {
+        game.joined = true;
+    }
+}
+
 fn connect(game: &Rc<RefCell<Game>>) -> Result<(), String> {
     let (address, name) = {
         let game = game.borrow();
@@ -689,16 +884,20 @@ fn connect(game: &Rc<RefCell<Game>>) -> Result<(), String> {
         game.map = Map::Camel;
         game.yaw = -std::f32::consts::FRAC_PI_2;
         game.pitch = 0.0;
+        game.vertical = 0.0;
+        game.jump = false;
         game.socket = Some(socket.clone());
         game.last_sent = 0.0;
+        game.joined = false;
+        game.team = None;
         game.refresh_hud();
-        game.show_screen(Screen::Playing);
+        game.show_screen(Screen::Team);
         game.session
     };
 
-    let open_socket = socket.clone();
+    let open_game = game.clone();
     let open = Closure::<dyn FnMut(Event)>::new(move |_| {
-        let _ = open_socket.send_with_str(&format!("JOIN|{name}"));
+        send_join(&open_game);
     });
     socket.set_onopen(Some(open.as_ref().unchecked_ref()));
     open.forget();
@@ -715,18 +914,22 @@ fn connect(game: &Rc<RefCell<Game>>) -> Result<(), String> {
         let mut parts = text.split('|');
         match parts.next() {
             Some("WELCOME") => {
-                if let (Some(id), Some(x), Some(z), Some(health)) =
-                    (parts.next(), parts.next(), parts.next(), parts.next())
-                {
-                    if let (Ok(id), Ok(x), Ok(z), Ok(health)) = (
+                if let (Some(id), Some(x), Some(z), Some(y), Some(health)) = (
+                    parts.next(),
+                    parts.next(),
+                    parts.next(),
+                    parts.next(),
+                    parts.next(),
+                ) {
+                    if let (Ok(id), Ok(x), Ok(z), Ok(y), Ok(health)) = (
                         id.parse::<u32>(),
                         x.parse::<f32>(),
                         z.parse::<f32>(),
+                        y.parse::<f32>(),
                         health.parse::<u8>(),
                     ) {
-                        let floor = map::stand_height(Map::Camel, x, z, map::CAMEL_SPAWN[1], 0.0)
-                            .unwrap_or(map::CAMEL_SPAWN[1]);
-                        game.position = Vec3::new(x, floor + 1.7, z);
+                        game.position = Vec3::new(x, y + map::EYE_HEIGHT, z);
+                        game.vertical = 0.0;
                         game.self_id = Some(id);
                         game.health = health;
                         game.refresh_health();
@@ -735,21 +938,69 @@ fn connect(game: &Rc<RefCell<Game>>) -> Result<(), String> {
                     }
                 }
             }
+            Some("SCORE") => {
+                if let (Some(Ok(boys)), Some(Ok(girls))) = (
+                    parts.next().map(str::parse::<u32>),
+                    parts.next().map(str::parse::<u32>),
+                ) {
+                    game.refresh_score(boys, girls);
+                }
+            }
+            Some("WIN") => {
+                if let Some(winner) = parts.next() {
+                    let remaining = parts
+                        .next()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(10.0);
+                    game.winner = Some(if winner == "girls" {
+                        Team::Girls
+                    } else {
+                        Team::Boys
+                    });
+                    game.result_deadline = game.last_frame + remaining * 1000.0;
+                    game.show_screen(Screen::Result);
+                }
+            }
+            Some("AT") => {
+                if let (Some(x), Some(y), Some(z)) = (parts.next(), parts.next(), parts.next()) {
+                    if let (Ok(x), Ok(y), Ok(z)) =
+                        (x.parse::<f32>(), y.parse::<f32>(), z.parse::<f32>())
+                    {
+                        game.position = Vec3::new(x, y + map::EYE_HEIGHT, z);
+                        game.vertical = 0.0;
+                        game.shot_at = f64::NEG_INFINITY;
+                        game.show_screen(Screen::Playing);
+                    }
+                }
+            }
             Some("ADD") => {
-                let (Some(id), Some(name), Some(x), Some(z), Some(yaw), Some(health)) = (
+                let (
+                    Some(id),
+                    Some(name),
+                    Some(x),
+                    Some(z),
+                    Some(y),
+                    Some(yaw),
+                    Some(health),
+                    Some(team),
+                ) = (
                     parts.next(),
                     parts.next(),
                     parts.next(),
                     parts.next(),
                     parts.next(),
                     parts.next(),
-                ) else {
+                    parts.next(),
+                    parts.next(),
+                )
+                else {
                     return;
                 };
-                if let (Ok(id), Ok(x), Ok(z), Ok(yaw), Ok(health)) = (
+                if let (Ok(id), Ok(x), Ok(z), Ok(y), Ok(yaw), Ok(health)) = (
                     id.parse::<u32>(),
                     x.parse::<f32>(),
                     z.parse::<f32>(),
+                    y.parse::<f32>(),
                     yaw.parse::<f32>(),
                     health.parse::<u8>(),
                 ) {
@@ -759,10 +1010,14 @@ fn connect(game: &Rc<RefCell<Game>>) -> Result<(), String> {
                             name: name.to_owned(),
                             x,
                             z,
-                            y: map::stand_height(Map::Camel, x, z, map::CAMEL_SPAWN[1], 0.0)
-                                .unwrap_or(map::CAMEL_SPAWN[1]),
+                            y,
                             yaw,
                             health,
+                            team: if team == "girls" {
+                                Team::Girls
+                            } else {
+                                Team::Boys
+                            },
                         },
                     );
                     game.refresh_hud();
@@ -807,7 +1062,11 @@ fn connect(game: &Rc<RefCell<Game>>) -> Result<(), String> {
                     let mut hit_position = None;
                     if game.self_id == Some(id) {
                         if health < game.health {
-                            hit_position = Some(Vec3::new(game.position.x, game.position.y - 0.6, game.position.z));
+                            hit_position = Some(Vec3::new(
+                                game.position.x,
+                                game.position.y - 0.6,
+                                game.position.z,
+                            ));
                             if game.blood_input.checked() {
                                 game.local_hit_at = game.last_frame;
                             }
@@ -815,6 +1074,9 @@ fn connect(game: &Rc<RefCell<Game>>) -> Result<(), String> {
                         game.health = health;
                         game.refresh_health();
                         game.refresh_hud();
+                        if health == 0 && game.winner.is_none() {
+                            game.show_screen(Screen::Dead);
+                        }
                     } else if let Some(player) = game.remote.get_mut(&id) {
                         if health < player.health {
                             hit_position = Some(Vec3::new(player.x, player.y + 1.1, player.z));
@@ -1000,6 +1262,17 @@ fn start() -> Result<(), JsValue> {
          text-shadow:1px 1px 2px black;font:16px system-ui",
     )?;
     document.body().unwrap().append_child(&fps_hud)?;
+    let score_hud: HtmlElement = document.create_element("div")?.dyn_into()?;
+    score_hud.set_attribute(
+        "style",
+        "position:fixed;top:12px;left:50%;transform:translateX(-50%);display:flex;\
+         gap:28px;font:20px system-ui;font-weight:bold;text-shadow:1px 1px 2px black",
+    )?;
+    let boys_score: HtmlElement = document.create_element("div")?.dyn_into()?;
+    score_hud.append_child(&boys_score)?;
+    let girls_score: HtmlElement = document.create_element("div")?.dyn_into()?;
+    score_hud.append_child(&girls_score)?;
+    document.body().unwrap().append_child(&score_hud)?;
     let health_hud: HtmlElement = document.create_element("div")?.dyn_into()?;
     health_hud.set_attribute(
         "style",
@@ -1078,7 +1351,14 @@ fn start() -> Result<(), JsValue> {
             CamelPart {
                 first: fields.next().unwrap().parse().unwrap(),
                 count: fields.next().unwrap().parse().unwrap(),
-                image: fields.next().unwrap().split('.').next().unwrap().parse().unwrap(),
+                image: fields
+                    .next()
+                    .unwrap()
+                    .split('.')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
             }
         })
         .collect();
@@ -1096,30 +1376,8 @@ fn start() -> Result<(), JsValue> {
     gl.vertex_attrib_pointer_with_i32(4, 2, Gl::FLOAT, false, 16, 8);
     gl.enable_vertex_attrib_array(4);
 
-    let mut operative_vaos = Vec::new();
-    for [left, top, right, bottom] in OPERATIVE_VIEWS {
-        let (u0, v0, u1, v1) = (left / 1536.0, top / 1024.0, right / 1536.0, bottom / 1024.0);
-        let quad = [
-            -1.0, -1.0, u0, v1, 1.0, -1.0, u1, v1, 1.0, 1.0, u1, v0, -1.0, -1.0, u0, v1, 1.0, 1.0,
-            u1, v0, -1.0, 1.0, u0, v0,
-        ];
-        let operative_vao = gl
-            .create_vertex_array()
-            .ok_or("No operative vertex array")?;
-        gl.bind_vertex_array(Some(&operative_vao));
-        let buffer = gl.create_buffer().ok_or("No operative vertex buffer")?;
-        gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&buffer));
-        gl.buffer_data_with_array_buffer_view(
-            Gl::ARRAY_BUFFER,
-            &js_sys::Float32Array::from(quad.as_slice()),
-            Gl::STATIC_DRAW,
-        );
-        gl.vertex_attrib_pointer_with_i32(0, 2, Gl::FLOAT, false, 16, 0);
-        gl.enable_vertex_attrib_array(0);
-        gl.vertex_attrib_pointer_with_i32(4, 2, Gl::FLOAT, false, 16, 8);
-        gl.enable_vertex_attrib_array(4);
-        operative_vaos.push(operative_vao);
-    }
+    let operative_vaos = build_operative_vaos(&gl, &OPERATIVE_VIEWS, 1536.0, 1024.0)?;
+    let girl_vaos = build_operative_vaos(&gl, &GIRL_VIEWS, 1448.0, 1086.0)?;
 
     let game = Rc::new(RefCell::new(Game {
         gl,
@@ -1134,14 +1392,18 @@ fn start() -> Result<(), JsValue> {
         sprite_program,
         sprite_vao,
         operative_vaos,
+        girl_vaos,
         sprite_transform,
         textures: [None, None, None],
         operative_texture: None,
+        girl_texture: None,
         shot_at: f64::NEG_INFINITY,
         position: Vec3::new(0.0, 1.7, 5.0),
         yaw: -std::f32::consts::FRAC_PI_2,
         pitch: 0.0,
         keys: [false; 4],
+        jump: false,
+        vertical: 0.0,
         last_frame: 0.0,
         screen: Screen::Main,
         map: Map::Test,
@@ -1161,6 +1423,9 @@ fn start() -> Result<(), JsValue> {
         fps_hud,
         fps_since: 0.0,
         fps_frames: 0,
+        score_hud,
+        boys_score,
+        girls_score,
         health_hud,
         health_label,
         health_fill,
@@ -1168,6 +1433,10 @@ fn start() -> Result<(), JsValue> {
         self_id: None,
         socket: None,
         connected: false,
+        joined: false,
+        team: None,
+        winner: None,
+        result_deadline: 0.0,
         session: 0,
         last_sent: 0.0,
         remote: HashMap::new(),
@@ -1261,36 +1530,20 @@ fn start() -> Result<(), JsValue> {
         image.set_src(path);
     }
 
-    let image = HtmlImageElement::new()?;
-    let loaded_image = image.clone();
-    let loaded_game = game.clone();
-    let load = Closure::<dyn FnMut()>::new(move || {
-        let mut game = loaded_game.borrow_mut();
-        let gl = &game.gl;
-        if let Some(texture) = gl.create_texture() {
-            gl.bind_texture(Gl::TEXTURE_2D, Some(&texture));
-            gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::LINEAR as i32);
-            gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::LINEAR as i32);
-            gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE as i32);
-            gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE as i32);
-            if gl
-                .tex_image_2d_with_u32_and_u32_and_html_image_element(
-                    Gl::TEXTURE_2D,
-                    0,
-                    Gl::RGBA as i32,
-                    Gl::RGBA,
-                    Gl::UNSIGNED_BYTE,
-                    &loaded_image,
-                )
-                .is_ok()
-            {
-                game.operative_texture = Some(texture);
-            }
-        }
-    });
-    image.add_event_listener_with_callback("load", load.as_ref().unchecked_ref())?;
-    load.forget();
-    image.set_src("assets/operative_turnaround.png");
+    load_texture(
+        game.clone(),
+        "assets/operative_turnaround.png",
+        |game, texture| {
+            game.operative_texture = Some(texture);
+        },
+    )?;
+    load_texture(
+        game.clone(),
+        "assets/girl_turnaround.png",
+        |game, texture| {
+            game.girl_texture = Some(texture);
+        },
+    )?;
 
     // Original CC BY 4.0 images embedded in the supplied Sketchfab GLB.
     for index in 0..34 {
@@ -1381,10 +1634,27 @@ fn start() -> Result<(), JsValue> {
         let button_lock = lock_pointer.clone();
         let action = Closure::<dyn FnMut()>::new(move || {
             if button_game.borrow().screen == Screen::Join && index == 0 {
-                match connect(&button_game) {
-                    Ok(()) => button_lock(),
-                    Err(error) => button_game.borrow().status.set_inner_text(&error),
+                if let Err(error) = connect(&button_game) {
+                    button_game.borrow().status.set_inner_text(&error);
                 }
+                return;
+            }
+            if button_game.borrow().screen == Screen::Team && index < 2 {
+                {
+                    let mut game = button_game.borrow_mut();
+                    game.team = Some(if index == 0 { Team::Boys } else { Team::Girls });
+                    game.show_screen(Screen::Playing);
+                }
+                send_join(&button_game);
+                button_lock();
+                return;
+            }
+            if button_game.borrow().screen == Screen::Dead && index == 0 {
+                if let Some(socket) = button_game.borrow().socket.clone() {
+                    let _ = socket.send_with_str("RESPAWN");
+                }
+                button_game.borrow_mut().show_screen(Screen::Playing);
+                button_lock();
                 return;
             }
             let mut game = button_game.borrow_mut();
@@ -1400,12 +1670,18 @@ fn start() -> Result<(), JsValue> {
                     game.disconnect();
                     game.map = if index == 0 { Map::Camel } else { Map::Test };
                     game.position = if index == 0 {
-                        Vec3::new(map::CAMEL_SPAWN[0], map::CAMEL_SPAWN[1] + 1.7, map::CAMEL_SPAWN[2])
+                        Vec3::new(
+                            map::CAMEL_SPAWN[0],
+                            map::CAMEL_SPAWN[1] + 1.7,
+                            map::CAMEL_SPAWN[2],
+                        )
                     } else {
                         Vec3::new(0.0, 1.7, 5.0)
                     };
                     game.yaw = -std::f32::consts::FRAC_PI_2;
                     game.pitch = 0.0;
+                    game.vertical = 0.0;
+                    game.jump = false;
                     game.shot_at = f64::NEG_INFINITY;
                     game.health = 3;
                     game.refresh_health();
@@ -1443,6 +1719,11 @@ fn start() -> Result<(), JsValue> {
             return;
         }
         let mut game = click_game.borrow_mut();
+        if game.last_frame - game.shot_at < FIRE_COOLDOWN_MS {
+            drop(game);
+            click_lock();
+            return;
+        }
         game.shot_at = game.last_frame;
         if game.connected {
             if let Some(socket) = &game.socket {
@@ -1512,9 +1793,25 @@ fn start() -> Result<(), JsValue> {
                     Screen::Modes => game.show_screen(Screen::Main),
                     Screen::MapSelect => game.show_screen(Screen::Modes),
                     Screen::Join => game.show_screen(Screen::Modes),
+                    Screen::Team => {
+                        game.disconnect();
+                        game.show_screen(Screen::Join);
+                    }
+                    Screen::Dead | Screen::Result => {
+                        game.show_screen(Screen::Paused);
+                        key_document.exit_pointer_lock();
+                    }
                     Screen::SettingsMain => game.show_screen(Screen::Main),
                     Screen::SettingsPaused => game.show_screen(Screen::Paused),
                     _ => {}
+                }
+                return;
+            }
+            if event.code() == "Space" && !event.repeat() {
+                event.prevent_default();
+                let mut game = key_game.borrow_mut();
+                if game.screen == Screen::Playing {
+                    game.jump = pressed;
                 }
                 return;
             }
@@ -1548,6 +1845,77 @@ fn start() -> Result<(), JsValue> {
     }));
     window.request_animation_frame(next.borrow().as_ref().unwrap().as_ref().unchecked_ref())?;
     Ok(())
+}
+
+fn load_texture(
+    game: Rc<RefCell<Game>>,
+    src: &str,
+    assign: fn(&mut Game, WebGlTexture),
+) -> Result<(), JsValue> {
+    let image = HtmlImageElement::new()?;
+    let loaded_image = image.clone();
+    let loaded_game = game.clone();
+    let load = Closure::<dyn FnMut()>::new(move || {
+        let mut game = loaded_game.borrow_mut();
+        let gl = &game.gl;
+        if let Some(texture) = gl.create_texture() {
+            gl.bind_texture(Gl::TEXTURE_2D, Some(&texture));
+            gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::LINEAR as i32);
+            gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::LINEAR as i32);
+            gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE as i32);
+            gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE as i32);
+            if gl
+                .tex_image_2d_with_u32_and_u32_and_html_image_element(
+                    Gl::TEXTURE_2D,
+                    0,
+                    Gl::RGBA as i32,
+                    Gl::RGBA,
+                    Gl::UNSIGNED_BYTE,
+                    &loaded_image,
+                )
+                .is_ok()
+            {
+                assign(&mut game, texture);
+            }
+        }
+    });
+    image.add_event_listener_with_callback("load", load.as_ref().unchecked_ref())?;
+    load.forget();
+    image.set_src(src);
+    Ok(())
+}
+
+fn build_operative_vaos(
+    gl: &Gl,
+    views: &[[f32; 4]; 4],
+    width: f32,
+    height: f32,
+) -> Result<Vec<WebGlVertexArrayObject>, JsValue> {
+    let mut vaos = Vec::new();
+    for &[left, top, right, bottom] in views {
+        let (u0, v0, u1, v1) = (left / width, top / height, right / width, bottom / height);
+        let quad = [
+            -1.0, -1.0, u0, v1, 1.0, -1.0, u1, v1, 1.0, 1.0, u1, v0, -1.0, -1.0, u0, v1, 1.0, 1.0,
+            u1, v0, -1.0, 1.0, u0, v0,
+        ];
+        let vao = gl
+            .create_vertex_array()
+            .ok_or("No operative vertex array")?;
+        gl.bind_vertex_array(Some(&vao));
+        let buffer = gl.create_buffer().ok_or("No operative vertex buffer")?;
+        gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&buffer));
+        gl.buffer_data_with_array_buffer_view(
+            Gl::ARRAY_BUFFER,
+            &js_sys::Float32Array::from(quad.as_slice()),
+            Gl::STATIC_DRAW,
+        );
+        gl.vertex_attrib_pointer_with_i32(0, 2, Gl::FLOAT, false, 16, 0);
+        gl.enable_vertex_attrib_array(0);
+        gl.vertex_attrib_pointer_with_i32(4, 2, Gl::FLOAT, false, 16, 8);
+        gl.enable_vertex_attrib_array(4);
+        vaos.push(vao);
+    }
+    Ok(vaos)
 }
 
 // Adapted from wasm-bindgen/examples/webgl/src/lib.rs, lines 89-134.

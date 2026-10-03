@@ -33,15 +33,32 @@ for that machine and run `./keles-server 0.0.0.0:9001`. The Cargo build
 directory is not needed at runtime.
 
 Choose **Play → Multiplayer**, enter `IP_ADDRESS:9001` and a nickname, and
-connect. Each browser loads the same map locally; the server relays positions,
-headings, and health. Other players use four transparent 2D views selected
+connect, then pick a team on the **Choose your team** screen. Boys and girls
+use different four-view sprites (boys: `assets/operative_turnaround.png`,
+girls: the supplied `assets/girl_turnaround.png`); the server relays each
+player's team along with positions, headings, and health. Each browser loads
+the same map locally. Other players use four transparent 2D views selected
 from their facing direction. Click to fire: a shot through a player's 3D
 hitbox removes one of three health points, and boxes block shots. Your health
-bar is at the bottom left. After three hits a player dies and their model
-disappears; reconnecting resets health. The server
+bar is at the bottom left.
+
+Girls always spawn on the CT side and boys on the T side of the de_dust2
+replica, at a random point on that team's terrace so players do not stack. The
+terrace rectangles and floors live in `src/map.rs`
+(`CAMEL_T_SPAWN` / `CAMEL_CT_SPAWN`); they are derived from the map's
+`info_player_*` entities through the model's known root transform. A scoreboard
+at the top counts each team's kills (girls pink, boys blue, your team marked).
+Three hits kill a player; that player gets a **Respawn** button and returns to
+their team's terrace, one kill goes to the shooter's team, and the first team
+to 40 wins. The win or loss screen counts down 10 seconds, then the round
+resets with scores cleared and everyone respawned. The server
 accepts up to 16 simultaneous connections and keeps no
 persistent game data. If the game page is served over HTTPS, put the relay
 behind a TLS reverse proxy and enter a `wss://` address.
+
+Character sprites: the boys and girls four-view turnarounds
+(`assets/operative_turnaround.png`, `assets/girl_turnaround.png`) and the
+weapon images are supplied by the project owner.
 
 Camel asset credit: **"de_dust2 - CS map" by vrchris**
 ([Sketchfab source](https://sketchfab.com/3d-models/de-dust2-cs-map-056008d59eb849a29c0ab6884c0c3d87)),
