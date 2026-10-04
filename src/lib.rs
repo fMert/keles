@@ -173,7 +173,7 @@ struct RemotePlayer {
     x: f32,
     z: f32,
     y: f32,
-    // Latest 20 Hz update; x, y and z ease toward it each frame.
+    // Latest 32 Hz update; x, y and z ease toward it each frame.
     target: Vec3,
     yaw: f32,
     health: u8,
@@ -574,13 +574,23 @@ impl Game {
             let feet = self.position.y - map::EYE_HEIGHT;
             if movement.length_squared() > 0.0 {
                 let step = movement.normalize() * 4.0 * dt;
-                let x = self.position.x + step.x;
-                if !map::wall_blocked(self.map, x, self.position.z, feet, radius) {
-                    self.position.x = x;
-                }
-                let z = self.position.z + step.z;
-                if !map::wall_blocked(self.map, self.position.x, z, feet, radius) {
-                    self.position.z = z;
+                // Landing or stepping down beside a wall can leave the body inside
+                // it. Any move that does not get closer is then allowed, and steps
+                // no longer than the gap cannot cross a wall.
+                let mut gap =
+                    map::wall_gap(self.map, self.position.x, self.position.z, feet, radius);
+                for (dx, dz) in [(step.x, 0.0), (0.0, step.z)] {
+                    let limit = if gap < radius {
+                        gap.max(0.0)
+                    } else {
+                        f32::INFINITY
+                    };
+                    let x = self.position.x + dx.clamp(-limit, limit);
+                    let z = self.position.z + dz.clamp(-limit, limit);
+                    let next = map::wall_gap(self.map, x, z, feet, radius);
+                    if next >= radius || next >= gap {
+                        (self.position.x, self.position.z, gap) = (x, z, next);
+                    }
                 }
             }
             let feet = self.position.y - map::EYE_HEIGHT;
@@ -626,7 +636,7 @@ impl Game {
                 self.vertical = 0.0;
             }
         }
-        if self.screen == Screen::Playing && self.connected && now - self.last_sent >= 50.0 {
+        if self.screen == Screen::Playing && self.connected && now - self.last_sent >= 31.25 {
             if let Some(socket) = &self.socket {
                 if socket.ready_state() == WebSocket::OPEN {
                     let _ = socket.send_with_str(&format!(

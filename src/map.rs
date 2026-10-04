@@ -192,15 +192,21 @@ pub fn floor_at(map: Map, x: f32, z: f32, feet: f32, rise: f32) -> Option<f32> {
     floor
 }
 
-// A near-vertical face rising above the climbable step and overlapping the
-// player's body blocks movement at (x, z).
-pub fn wall_blocked(map: Map, x: f32, z: f32, feet: f32, radius: f32) -> bool {
+// Distance from (x, z) to the nearest near-vertical face that rises above the
+// climbable step, capped at `radius`; negative inside a Test box.
+pub fn wall_gap(map: Map, x: f32, z: f32, feet: f32, radius: f32) -> f32 {
+    let mut gap = radius;
     if map == Map::Test {
-        return TEST.iter().skip(1).any(|block| {
-            (x - block.center[0]).abs() < block.half[0] + radius
-                && (z - block.center[2]).abs() < block.half[2] + radius
-                && block.center[1] + block.half[1] > feet + STEP_UP
-        });
+        for block in TEST.iter().skip(1) {
+            if block.center[1] + block.half[1] <= feet + STEP_UP {
+                continue;
+            }
+            let dx = (x - block.center[0]).abs() - block.half[0];
+            let dz = (z - block.center[2]).abs() - block.half[2];
+            let outside = dx.max(0.0).hypot(dz.max(0.0));
+            gap = gap.min(if outside > 0.0 { outside } else { dx.max(dz) });
+        }
+        return gap;
     }
     for face in faces() {
         if face.normal_y.abs() > 0.6
@@ -220,12 +226,14 @@ pub fn wall_blocked(map: Map, x: f32, z: f32, feet: f32, radius: f32) -> bool {
             let dz = b[2] - a[2];
             let t = (((x - a[0]) * dx + (z - a[2]) * dz) / (dx * dx + dz * dz).max(0.00001))
                 .clamp(0.0, 1.0);
-            if (x - a[0] - t * dx).powi(2) + (z - a[2] - t * dz).powi(2) < radius * radius {
-                return true;
-            }
+            gap = gap.min((x - a[0] - t * dx).hypot(z - a[2] - t * dz));
         }
     }
-    false
+    gap
+}
+
+pub fn wall_blocked(map: Map, x: f32, z: f32, feet: f32, radius: f32) -> bool {
+    wall_gap(map, x, z, feet, radius) < radius
 }
 
 // Server-side move check: the floor below feet at `current` (which may be mid

@@ -8,11 +8,11 @@ or `wss://` address in **Play → Multiplayer** as before.
 
 Desktop downloads are on [GitHub Releases](https://github.com/fMert/keles/releases).
 The Linux amd64 `.deb` targets Debian 13 or a compatible newer distribution:
-install with `sudo apt install ./keles-desktop_0.2.2_amd64.deb`, then launch
+install with `sudo apt install ./keles-desktop_0.2.3_amd64.deb`, then launch
 **Keles** from the application menu or run `keles`. APT installs the required
 system runtime dependencies. Linux bundles Chromium Embedded Framework (CEF);
 Windows uses the system's Chromium-based WebView2. The Windows x64 executable is portable:
-double-click `keles-0.2.2-windows-x64.exe`. Windows 10/11 requires the
+double-click `keles-0.2.3-windows-x64.exe`. Windows 10/11 requires the
 [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/),
 which is usually already installed. The executable includes the MSVC runtime.
 Keep the release's `LICENSE` and `THIRD-PARTY-LICENSES.txt` with the Windows
@@ -30,7 +30,7 @@ cargo install cargo-deb --locked
 cd desktop
 cargo build --locked --release
 strip --strip-unneeded target/release/libcef.so
-cargo deb --locked --no-build --output ../dist/keles-desktop_0.2.2_amd64.deb
+cargo deb --locked --no-build --output ../dist/keles-desktop_0.2.3_amd64.deb
 ```
 
 On Windows, install Rust with the MSVC toolchain and Visual Studio C++ build

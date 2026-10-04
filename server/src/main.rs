@@ -210,7 +210,7 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
         .unwrap_or(0)
         ^ (id as u64) << 32;
     let mut rng = Rng::new(seed);
-    let (outgoing, incoming) = mpsc::sync_channel::<String>(64);
+    let (outgoing, incoming) = mpsc::sync_channel::<String>(128);
     let (existing, x, z, y, score, winner) = {
         let mut world = shared.lock().unwrap();
         if world.players.values().any(|player| player.name == name) {
@@ -354,17 +354,20 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                             ) else {
                                 continue;
                             };
-                            // Clients send every 50 ms; a faster sender would flood
+                            // Clients send 32 times a second; a faster sender would flood
                             // everyone else's queue.
                             if ![x, z, feet, yaw].iter().all(|v| v.is_finite())
-                                || last_pos.elapsed() < Duration::from_millis(25)
+                                || last_pos.elapsed() < Duration::from_millis(15)
                             {
                                 continue;
                             }
                             // Checked from the client's own feet, so walking off a
                             // ledge or jumping onto a crate never leaves the server
                             // stuck at an old height.
-                            let Some(floor) = map::stand_height(map::Map::Camel, x, z, feet, 0.28)
+                            // Radius 0: a client stepping out of a wall it landed in is
+                            // still partly inside it. ponytail: walls are not checked
+                            // here; trace the move segment if wall cheats matter.
+                            let Some(floor) = map::stand_height(map::Map::Camel, x, z, feet, 0.0)
                             else {
                                 continue;
                             };
