@@ -79,6 +79,48 @@ void main()
 }
 "#;
 
+// Menu and HUD styling after the logo: charred black panels, crimson-to-amber
+// glow and beveled corners like its lettering.
+const STYLE: &str = "
+body{margin:0;overflow:hidden;background:#050202}
+canvas{display:block}
+.k-menu{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+ background:radial-gradient(ellipse at 50% 38%,rgba(130,24,6,.6),rgba(8,3,2,.95) 72%);
+ color:#ffe6da;font:20px system-ui,sans-serif}
+.k-panel{display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center}
+.k-logo{max-width:92vw;max-height:58vh;margin:-24px 0 0;filter:drop-shadow(0 0 28px rgba(255,70,20,.35))}
+.k-title{margin:0 0 8px;font:900 46px Impact,'Arial Black',sans-serif;letter-spacing:4px;
+ text-transform:uppercase;background:linear-gradient(#ffd08a,#ff5a1c 55%,#a3150a);
+ -webkit-background-clip:text;background-clip:text;color:transparent;
+ filter:drop-shadow(0 0 12px rgba(255,80,20,.55))}
+.k-button,.k-input,.k-settings{width:340px;box-sizing:border-box;
+ clip-path:polygon(16px 0,100% 0,100% calc(100% - 16px),calc(100% - 16px) 100%,0 100%,0 16px)}
+.k-button{padding:14px;cursor:pointer;color:#ffe2d4;font:800 20px Impact,'Arial Black',sans-serif;
+ letter-spacing:3px;text-transform:uppercase;border:1px solid #ff4a1c;
+ background:linear-gradient(#3a120a,#140605);box-shadow:inset 0 0 18px rgba(255,74,28,.35);
+ text-shadow:0 0 8px rgba(255,90,30,.8);transition:background .15s,color .15s}
+.k-button:hover:not(:disabled){background:linear-gradient(#a3260c,#3d0d05);color:#fff}
+.k-button:disabled{cursor:default}
+.k-input{padding:12px 18px;font:18px system-ui,sans-serif;color:#ffe6da;background:#160806;
+ border:1px solid #7a2412;outline:none}
+.k-input:focus{border-color:#ff5a1c;box-shadow:inset 0 0 12px rgba(255,90,28,.35)}
+.k-status{max-width:340px;font:16px system-ui,sans-serif;color:#f0a98a}
+.k-settings{display:none;flex-direction:column;gap:10px;padding:18px 22px;text-align:left;
+ font:18px system-ui,sans-serif;border:1px solid #7a2412;
+ background:linear-gradient(rgba(44,13,7,.92),rgba(14,5,4,.92))}
+.k-settings input{accent-color:#ff4a1c}
+.k-row{display:flex;justify-content:space-between}
+.k-hud{position:fixed;color:#ffe6da;font:16px system-ui,sans-serif;text-shadow:0 0 6px #000,1px 1px 2px #000}
+.k-score{position:fixed;top:12px;left:50%;transform:translateX(-50%);display:flex;align-items:center;
+ gap:18px;padding:6px 26px;border:1px solid rgba(255,74,28,.6);
+ background:linear-gradient(rgba(44,13,7,.86),rgba(10,4,3,.86));
+ clip-path:polygon(14px 0,calc(100% - 14px) 0,100% 50%,calc(100% - 14px) 100%,14px 100%,0 50%);
+ font:bold 20px Impact,'Arial Black',sans-serif;text-shadow:1px 1px 2px #000}
+.k-health{width:180px;height:14px;margin-top:5px;background:#1c0806;border:1px solid #ff4a1c;
+ clip-path:polygon(6px 0,100% 0,calc(100% - 6px) 100%,0 100%)}
+.k-health div{height:100%;background:linear-gradient(90deg,#ff2d0f,#ffb03a)}
+";
+
 const VERTICES: [f32; 24] = [
     -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, -1.0, 1.0, -1.0,
     -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0,
@@ -243,6 +285,7 @@ struct Game {
     map: Map,
     menu: HtmlElement,
     menu_title: HtmlElement,
+    logo: HtmlImageElement,
     menu_buttons: Vec<HtmlButtonElement>,
     server_input: HtmlInputElement,
     nickname_input: HtmlInputElement,
@@ -258,8 +301,6 @@ struct Game {
     fps_since: f64,
     fps_frames: u32,
     score_hud: HtmlElement,
-    boys_score: HtmlElement,
-    girls_score: HtmlElement,
     health_hud: HtmlElement,
     health_label: HtmlElement,
     health_fill: HtmlElement,
@@ -335,20 +376,31 @@ impl Game {
         self.refresh_score(0, 0);
     }
 
-    // Paints the top scoreboard; the local team's name gets a "(you)" suffix.
+    // Paints the top scoreboard: each team's kills around the kill target, with
+    // the local team marked. Only constants and numbers go into this HTML.
     fn refresh_score(&self, boys: u32, girls: u32) {
-        for (element, team, score) in [
-            (&self.boys_score, Team::Boys, boys),
-            (&self.girls_score, Team::Girls, girls),
-        ] {
+        let column = |team: Team, score: u32| {
             let you = if self.team == Some(team) {
-                " (you)"
+                " · YOU"
             } else {
                 ""
             };
-            element.set_inner_text(&format!("{}{}: {score}", team.label(), you));
-            let _ = element.style().set_property("color", team.color());
-        }
+            format!(
+                "<div style='min-width:72px;text-align:center;color:{}'>\
+                 <div style='font-size:12px'>{}{you}</div>\
+                 <div style='font-size:34px;line-height:1'>{score}</div></div>",
+                team.color(),
+                team.label().to_uppercase()
+            )
+        };
+        self.score_hud.set_inner_html(&format!(
+            "{}<div style='text-align:center;color:#c8ccd4'>\
+             <div style='font-size:11px'>TEAM KILL</div>\
+             <div style='font-size:20px'>{}</div></div>{}",
+            column(Team::Boys, boys),
+            map::WIN_SCORE,
+            column(Team::Girls, girls)
+        ));
     }
 
     fn refresh_health(&self) {
@@ -402,7 +454,7 @@ impl Game {
             },
         );
         let (title, labels) = match screen {
-            Screen::Main => ("Keles", ["Play", "Settings", "Coming soon"]),
+            Screen::Main => ("", ["Play", "Settings", "Coming soon"]),
             Screen::Modes => ("Choose mode", ["Multiplayer", "Single player", ""]),
             Screen::MapSelect => ("Choose map", ["Camel", "Test", "Back"]),
             Screen::Join => ("Multiplayer", ["Connect", "Back", ""]),
@@ -420,6 +472,14 @@ impl Game {
             Screen::Playing => ("", ["", "", ""]),
         };
         self.menu_title.set_inner_text(title);
+        for (element, shown) in [
+            (&self.menu_title, !title.is_empty()),
+            (&self.logo, screen == Screen::Main),
+        ] {
+            let _ = element
+                .style()
+                .set_property("display", if shown { "block" } else { "none" });
+        }
         if matches!(screen, Screen::Modes | Screen::MapSelect) {
             self.status.set_inner_text("Press Escape to go back");
         }
@@ -495,7 +555,7 @@ impl Game {
             if self.socket.is_some()
                 && (in_match || matches!(screen, Screen::Dead | Screen::Result))
             {
-                "block"
+                "flex"
             } else {
                 "none"
             },
@@ -1165,63 +1225,50 @@ fn connect(game: &Rc<RefCell<Game>>, team: Team) -> Result<(), String> {
 fn start() -> Result<(), JsValue> {
     let window = web_sys::window().ok_or("No window")?;
     let document = window.document().ok_or("No document")?;
-    document
-        .body()
-        .ok_or("No body")?
-        .set_attribute("style", "margin:0;overflow:hidden")?;
+    let style = document.create_element("style")?;
+    style.set_text_content(Some(STYLE));
+    document.body().ok_or("No body")?.append_child(&style)?;
     let canvas: HtmlCanvasElement = document
         .get_element_by_id("game")
         .ok_or("No canvas")?
         .dyn_into()?;
-    canvas.set_attribute("style", "display:block")?;
     let gl: Gl = canvas
         .get_context("webgl2")?
         .ok_or("WebGL2 unavailable")?
         .dyn_into()?;
 
     let menu: HtmlElement = document.create_element("div")?.dyn_into()?;
-    menu.set_attribute(
-        "style",
-        "position:fixed;inset:0;display:flex;align-items:center;justify-content:center;\
-         background:rgba(0,0,0,.65);color:white;font:24px system-ui",
-    )?;
+    menu.set_class_name("k-menu");
     let panel: HtmlElement = document.create_element("div")?.dyn_into()?;
-    panel.set_attribute(
-        "style",
-        "display:flex;flex-direction:column;gap:12px;min-width:240px;text-align:center",
-    )?;
+    panel.set_class_name("k-panel");
+    let logo = HtmlImageElement::new()?;
+    logo.set_class_name("k-logo");
+    logo.set_alt("Keles");
+    logo.set_src("assets/logo.png");
+    panel.append_child(&logo)?;
     let menu_title: HtmlElement = document.create_element("h1")?.dyn_into()?;
-    menu_title.set_attribute("style", "font:36px system-ui;margin:0 0 16px")?;
+    menu_title.set_class_name("k-title");
     panel.append_child(&menu_title)?;
     let server_input: HtmlInputElement = document.create_element("input")?.dyn_into()?;
     server_input.set_attribute("aria-label", "Server address")?;
     server_input.set_attribute("placeholder", "Server IP:port or wss:// address")?;
-    server_input.set_attribute(
-        "style",
-        "font:18px system-ui;padding:10px;box-sizing:border-box;width:100%",
-    )?;
+    server_input.set_class_name("k-input");
     server_input.set_value("127.0.0.1:9001");
     panel.append_child(&server_input)?;
     let nickname_input: HtmlInputElement = document.create_element("input")?.dyn_into()?;
     nickname_input.set_attribute("aria-label", "Nickname")?;
     nickname_input.set_attribute("placeholder", "Nickname")?;
     nickname_input.set_attribute("maxlength", "16")?;
-    nickname_input.set_attribute(
-        "style",
-        "font:18px system-ui;padding:10px;box-sizing:border-box;width:100%",
-    )?;
+    nickname_input.set_class_name("k-input");
     panel.append_child(&nickname_input)?;
     let status: HtmlElement = document.create_element("div")?.dyn_into()?;
-    status.set_attribute("style", "font:16px system-ui;max-width:300px")?;
+    status.set_class_name("k-status");
     panel.append_child(&status)?;
     let settings_panel: HtmlElement = document.create_element("div")?.dyn_into()?;
-    settings_panel.set_attribute(
-        "style",
-        "display:none;flex-direction:column;gap:8px;text-align:left;font:18px system-ui",
-    )?;
+    settings_panel.set_class_name("k-settings");
     let sensitivity_label: HtmlElement = document.create_element("label")?.dyn_into()?;
     sensitivity_label.set_attribute("for", "sensitivity")?;
-    sensitivity_label.set_inner_text("Sensitivity: 100% (Minecraft Java)");
+    sensitivity_label.set_inner_text("Sensitivity: 100%");
     settings_panel.append_child(&sensitivity_label)?;
     let sensitivity_input: HtmlInputElement = document.create_element("input")?.dyn_into()?;
     sensitivity_input.set_type("range");
@@ -1232,7 +1279,7 @@ fn start() -> Result<(), JsValue> {
     sensitivity_input.set_value("100");
     settings_panel.append_child(&sensitivity_input)?;
     let raw_label: HtmlElement = document.create_element("label")?.dyn_into()?;
-    raw_label.set_attribute("style", "display:flex;justify-content:space-between")?;
+    raw_label.set_class_name("k-row");
     raw_label.set_inner_text("Raw input");
     let raw_input: HtmlInputElement = document.create_element("input")?.dyn_into()?;
     raw_input.set_type("checkbox");
@@ -1241,7 +1288,7 @@ fn start() -> Result<(), JsValue> {
     settings_panel.append_child(&raw_label)?;
     let hud_scale_label: HtmlElement = document.create_element("label")?.dyn_into()?;
     hud_scale_label.set_attribute("for", "hud-scale")?;
-    hud_scale_label.set_inner_text("HUD scale: 100%");
+    hud_scale_label.set_inner_text("HUD scale: 200%");
     settings_panel.append_child(&hud_scale_label)?;
     let hud_scale_input: HtmlInputElement = document.create_element("input")?.dyn_into()?;
     hud_scale_input.set_type("range");
@@ -1249,10 +1296,10 @@ fn start() -> Result<(), JsValue> {
     hud_scale_input.set_min("50");
     hud_scale_input.set_max("200");
     hud_scale_input.set_step("10");
-    hud_scale_input.set_value("100");
+    hud_scale_input.set_value("200");
     settings_panel.append_child(&hud_scale_input)?;
     let fps_label: HtmlElement = document.create_element("label")?.dyn_into()?;
-    fps_label.set_attribute("style", "display:flex;justify-content:space-between")?;
+    fps_label.set_class_name("k-row");
     fps_label.set_inner_text("Show FPS");
     let fps_input: HtmlInputElement = document.create_element("input")?.dyn_into()?;
     fps_input.set_type("checkbox");
@@ -1260,7 +1307,7 @@ fn start() -> Result<(), JsValue> {
     fps_label.append_child(&fps_input)?;
     settings_panel.append_child(&fps_label)?;
     let blood_label: HtmlElement = document.create_element("label")?.dyn_into()?;
-    blood_label.set_attribute("style", "display:flex;justify-content:space-between")?;
+    blood_label.set_class_name("k-row");
     blood_label.set_inner_text("Show blood effects");
     let blood_input: HtmlInputElement = document.create_element("input")?.dyn_into()?;
     blood_input.set_type("checkbox");
@@ -1271,56 +1318,31 @@ fn start() -> Result<(), JsValue> {
     let mut menu_buttons = Vec::new();
     for _ in 0..3 {
         let button: HtmlButtonElement = document.create_element("button")?.dyn_into()?;
-        button.set_attribute(
-            "style",
-            "font:inherit;padding:12px;background:#242a35;color:white;\
-             border:1px solid #889;cursor:pointer",
-        )?;
+        button.set_class_name("k-button");
         panel.append_child(&button)?;
         menu_buttons.push(button);
     }
     menu.append_child(&panel)?;
     document.body().unwrap().append_child(&menu)?;
     let hud: HtmlElement = document.create_element("div")?.dyn_into()?;
-    hud.set_attribute(
-        "style",
-        "position:fixed;top:12px;left:12px;white-space:pre-line;\
-         color:white;text-shadow:1px 1px 2px black;font:16px system-ui",
-    )?;
+    hud.set_class_name("k-hud");
+    hud.set_attribute("style", "top:12px;left:12px;white-space:pre-line")?;
     document.body().unwrap().append_child(&hud)?;
     let fps_hud: HtmlElement = document.create_element("div")?.dyn_into()?;
-    fps_hud.set_attribute(
-        "style",
-        "position:fixed;top:12px;right:12px;color:white;\
-         text-shadow:1px 1px 2px black;font:16px system-ui",
-    )?;
+    fps_hud.set_class_name("k-hud");
+    fps_hud.set_attribute("style", "top:12px;right:12px")?;
     document.body().unwrap().append_child(&fps_hud)?;
     let score_hud: HtmlElement = document.create_element("div")?.dyn_into()?;
-    score_hud.set_attribute(
-        "style",
-        "position:fixed;top:12px;left:50%;transform:translateX(-50%);display:flex;\
-         gap:28px;font:20px system-ui;font-weight:bold;text-shadow:1px 1px 2px black",
-    )?;
-    let boys_score: HtmlElement = document.create_element("div")?.dyn_into()?;
-    score_hud.append_child(&boys_score)?;
-    let girls_score: HtmlElement = document.create_element("div")?.dyn_into()?;
-    score_hud.append_child(&girls_score)?;
+    score_hud.set_class_name("k-score");
     document.body().unwrap().append_child(&score_hud)?;
     let health_hud: HtmlElement = document.create_element("div")?.dyn_into()?;
-    health_hud.set_attribute(
-        "style",
-        "position:fixed;bottom:18px;left:18px;color:white;\
-         text-shadow:1px 1px 2px black;font:18px system-ui",
-    )?;
+    health_hud.set_class_name("k-hud");
+    health_hud.set_attribute("style", "bottom:18px;left:18px;font-size:18px")?;
     let health_label: HtmlElement = document.create_element("div")?.dyn_into()?;
     health_hud.append_child(&health_label)?;
     let health_back: HtmlElement = document.create_element("div")?.dyn_into()?;
-    health_back.set_attribute(
-        "style",
-        "width:180px;height:14px;margin-top:5px;background:#303030;border:1px solid white",
-    )?;
+    health_back.set_class_name("k-health");
     let health_fill: HtmlElement = document.create_element("div")?.dyn_into()?;
-    health_fill.set_attribute("style", "height:100%;background:#40c44c")?;
     health_back.append_child(&health_fill)?;
     health_hud.append_child(&health_back)?;
     document.body().unwrap().append_child(&health_hud)?;
@@ -1443,6 +1465,7 @@ fn start() -> Result<(), JsValue> {
         map: Map::Test,
         menu,
         menu_title,
+        logo,
         menu_buttons,
         server_input,
         nickname_input,
@@ -1458,8 +1481,6 @@ fn start() -> Result<(), JsValue> {
         fps_since: 0.0,
         fps_frames: 0,
         score_hud,
-        boys_score,
-        girls_score,
         health_hud,
         health_label,
         health_fill,
@@ -1484,10 +1505,7 @@ fn start() -> Result<(), JsValue> {
     let sensitivity_value = sensitivity_label.clone();
     let sensitivity_slider = game.borrow().sensitivity_input.clone();
     let sensitivity_changed = Closure::<dyn FnMut(Event)>::new(move |_| {
-        sensitivity_value.set_inner_text(&format!(
-            "Sensitivity: {}% (Minecraft Java)",
-            sensitivity_slider.value()
-        ));
+        sensitivity_value.set_inner_text(&format!("Sensitivity: {}%", sensitivity_slider.value()));
     });
     game.borrow()
         .sensitivity_input

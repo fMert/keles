@@ -20,7 +20,6 @@ const MAX_PLAYERS: usize = 16;
 // that never JOIN are only bounded by MAX_PLAYERS threads and the 5 s timeout.
 const MAX_PER_IP: usize = 4;
 const MAX_HEALTH: u8 = 3;
-const WIN_SCORE: u32 = 40;
 const ROUND_RESET: Duration = Duration::from_secs(10);
 
 struct Player {
@@ -476,9 +475,12 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                                         0,
                                         &format!("SCORE|{boys}|{girls}"),
                                     );
-                                    if boys >= WIN_SCORE || girls >= WIN_SCORE {
-                                        let winner =
-                                            if boys >= WIN_SCORE { "boys" } else { "girls" };
+                                    if boys >= map::WIN_SCORE || girls >= map::WIN_SCORE {
+                                        let winner = if boys >= map::WIN_SCORE {
+                                            "boys"
+                                        } else {
+                                            "girls"
+                                        };
                                         world.winner = Some(winner);
                                         world.reset_at = Some(Instant::now() + ROUND_RESET);
                                         broadcast(

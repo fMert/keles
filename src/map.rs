@@ -11,6 +11,9 @@ pub enum Map {
 // is scaled up to match. Tune here; both rendering and collision use it.
 pub const CAMEL_SCALE: f32 = 1.4;
 
+// Kills a team needs to win a round; the scoreboard shows it too.
+pub const WIN_SCORE: u32 = 40;
+
 pub const CAMEL_SPAWN: [f32; 3] = [-20.0 * CAMEL_SCALE, 3.4 * CAMEL_SCALE, 20.0 * CAMEL_SCALE];
 
 // Team spawn areas on the de_dust2 replica, as world-space [x0, z0, x1, z1]

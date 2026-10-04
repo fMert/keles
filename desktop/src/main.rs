@@ -44,6 +44,7 @@ fn asset_response(path: &str) -> Response<Vec<u8>> {
         "/assets/girl_turnaround.png" => {
             Some(include_bytes!("../../assets/girl_turnaround.png").as_slice())
         }
+        "/assets/logo.png" => Some(include_bytes!("../../assets/logo.png").as_slice()),
         _ => path
             .strip_prefix("/pkg/")
             .and_then(|p| PKG.get_file(p))
@@ -119,6 +120,7 @@ mod tests {
             ("/assets/weapon_flash.png", "image/png"),
             ("/assets/operative_turnaround.png", "image/png"),
             ("/assets/girl_turnaround.png", "image/png"),
+            ("/assets/logo.png", "image/png"),
         ] {
             let response = asset_response(path);
             assert_eq!(response.status(), 200, "{path}");

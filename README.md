@@ -172,7 +172,8 @@ behind a TLS reverse proxy and enter a `wss://` address.
 
 Character sprites: the boys and girls four-view turnarounds
 (`assets/operative_turnaround.png`, `assets/girl_turnaround.png`) and the
-weapon images are supplied by the project owner.
+weapon images and the logo (`assets/logo.png`) are supplied by the
+project owner.
 
 Camel asset credit: **"de_dust2 - CS map" by vrchris**
 ([Sketchfab source](https://sketchfab.com/3d-models/de-dust2-cs-map-056008d59eb849a29c0ab6884c0c3d87)),
