@@ -7,6 +7,8 @@ use web_sys::{
     KeyboardEvent, MessageEvent, MouseEvent, WebGl2RenderingContext as Gl, WebGlProgram,
     WebGlShader, WebGlTexture, WebGlUniformLocation, WebGlVertexArrayObject, WebSocket,
 };
+// Shared with the server; each side uses only part of it.
+#[allow(dead_code)]
 mod map;
 use map::Map;
 
@@ -171,6 +173,8 @@ struct RemotePlayer {
     x: f32,
     z: f32,
     y: f32,
+    // Latest 20 Hz update; x, y and z ease toward it each frame.
+    target: Vec3,
     yaw: f32,
     health: u8,
     team: Team,
@@ -543,6 +547,11 @@ impl Game {
 
         let dt = ((now - self.last_frame) / 1000.0).clamp(0.0, 0.05) as f32;
         self.last_frame = now;
+        let blend = (dt * 15.0).min(1.0);
+        for player in self.remote.values_mut() {
+            let eased = Vec3::new(player.x, player.y, player.z).lerp(player.target, blend);
+            (player.x, player.y, player.z) = (eased.x, eased.y, eased.z);
+        }
         if self.screen == Screen::Result {
             let remaining = ((self.result_deadline - now) / 1000.0).ceil().max(0.0) as u32;
             self.status
@@ -617,7 +626,7 @@ impl Game {
                 self.vertical = 0.0;
             }
         }
-        if self.screen == Screen::Playing && self.connected && now - self.last_sent >= 100.0 {
+        if self.screen == Screen::Playing && self.connected && now - self.last_sent >= 50.0 {
             if let Some(socket) = &self.socket {
                 if socket.ready_state() == WebSocket::OPEN {
                     let _ = socket.send_with_str(&format!(
@@ -970,7 +979,10 @@ fn connect(game: &Rc<RefCell<Game>>, team: Team) -> Result<(), String> {
                         // AT also starts a new round, so a past win must not block
                         // the death screen.
                         game.winner = None;
-                        game.show_screen(Screen::Playing);
+                        // Leave an open pause or settings menu alone.
+                        if !matches!(game.screen, Screen::Paused | Screen::SettingsPaused) {
+                            game.show_screen(Screen::Playing);
+                        }
                     }
                 }
             }
@@ -1012,6 +1024,7 @@ fn connect(game: &Rc<RefCell<Game>>, team: Team) -> Result<(), String> {
                             x,
                             z,
                             y,
+                            target: Vec3::new(x, y, z),
                             yaw,
                             health,
                             team: if team == "girls" {
@@ -1042,9 +1055,15 @@ fn connect(game: &Rc<RefCell<Game>>, team: Team) -> Result<(), String> {
                     yaw.parse::<f32>(),
                 ) {
                     if let Some(player) = game.remote.get_mut(&id) {
-                        player.x = x;
-                        player.z = z;
-                        player.y = y;
+                        player.target = Vec3::new(x, y, z);
+                        // Respawns teleport; only walking is smoothed.
+                        if player
+                            .target
+                            .distance(Vec3::new(player.x, player.y, player.z))
+                            > 5.0
+                        {
+                            (player.x, player.y, player.z) = (x, y, z);
+                        }
                         player.yaw = yaw;
                     }
                 }
@@ -1503,85 +1522,28 @@ fn start() -> Result<(), JsValue> {
     .into_iter()
     .enumerate()
     {
-        let image = HtmlImageElement::new()?;
-        let loaded_image = image.clone();
-        let loaded_game = game.clone();
-        let load = Closure::<dyn FnMut()>::new(move || {
-            let mut game = loaded_game.borrow_mut();
-            let gl = &game.gl;
-            if let Some(texture) = gl.create_texture() {
-                gl.bind_texture(Gl::TEXTURE_2D, Some(&texture));
-                gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::LINEAR as i32);
-                gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::LINEAR as i32);
-                gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE as i32);
-                gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE as i32);
-                if gl
-                    .tex_image_2d_with_u32_and_u32_and_html_image_element(
-                        Gl::TEXTURE_2D,
-                        0,
-                        Gl::RGBA as i32,
-                        Gl::RGBA,
-                        Gl::UNSIGNED_BYTE,
-                        &loaded_image,
-                    )
-                    .is_ok()
-                {
-                    game.textures[index] = Some(texture);
-                }
-            }
-        });
-        image.add_event_listener_with_callback("load", load.as_ref().unchecked_ref())?;
-        load.forget();
-        image.set_src(path);
+        load_texture(&game, path, Gl::CLAMP_TO_EDGE, move |game, texture| {
+            game.textures[index] = Some(texture);
+        })?;
     }
-
     load_texture(
-        game.clone(),
+        &game,
         "assets/operative_turnaround.png",
-        |game, texture| {
-            game.operative_texture = Some(texture);
-        },
+        Gl::CLAMP_TO_EDGE,
+        |game, texture| game.operative_texture = Some(texture),
     )?;
     load_texture(
-        game.clone(),
+        &game,
         "assets/girl_turnaround.png",
-        |game, texture| {
-            game.girl_texture = Some(texture);
-        },
+        Gl::CLAMP_TO_EDGE,
+        |game, texture| game.girl_texture = Some(texture),
     )?;
-
     // Original CC BY 4.0 images embedded in the supplied Sketchfab GLB.
     for index in 0..34 {
-        let image = HtmlImageElement::new()?;
-        let loaded_image = image.clone();
-        let loaded_game = game.clone();
-        let load = Closure::<dyn FnMut()>::new(move || {
-            let mut game = loaded_game.borrow_mut();
-            let gl = &game.gl;
-            if let Some(texture) = gl.create_texture() {
-                gl.bind_texture(Gl::TEXTURE_2D, Some(&texture));
-                gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::LINEAR as i32);
-                gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::LINEAR as i32);
-                gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, Gl::REPEAT as i32);
-                gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, Gl::REPEAT as i32);
-                if gl
-                    .tex_image_2d_with_u32_and_u32_and_html_image_element(
-                        Gl::TEXTURE_2D,
-                        0,
-                        Gl::RGBA as i32,
-                        Gl::RGBA,
-                        Gl::UNSIGNED_BYTE,
-                        &loaded_image,
-                    )
-                    .is_ok()
-                {
-                    game.camel_textures[index] = Some(texture);
-                }
-            }
-        });
-        image.add_event_listener_with_callback("load", load.as_ref().unchecked_ref())?;
-        load.forget();
-        image.set_src(&format!("assets/camel_images/{index}.png"));
+        let path = format!("assets/camel_images/{index}.png");
+        load_texture(&game, &path, Gl::REPEAT, move |game, texture| {
+            game.camel_textures[index] = Some(texture);
+        })?;
     }
 
     let lock_canvas = canvas.clone();
@@ -1720,6 +1682,7 @@ fn start() -> Result<(), JsValue> {
 
     let click_game = game.clone();
     let click_lock = lock_pointer.clone();
+    let click_document = document.clone();
     let click = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
         if event.button() != 0
             || click_game.borrow().screen != Screen::Playing
@@ -1727,10 +1690,13 @@ fn start() -> Result<(), JsValue> {
         {
             return;
         }
+        // A click that only recaptures the mouse should not also fire.
+        if click_document.pointer_lock_element().is_none() {
+            click_lock();
+            return;
+        }
         let mut game = click_game.borrow_mut();
         if game.last_frame - game.shot_at < FIRE_COOLDOWN_MS {
-            drop(game);
-            click_lock();
             return;
         }
         game.shot_at = game.last_frame;
@@ -1739,8 +1705,6 @@ fn start() -> Result<(), JsValue> {
                 let _ = socket.send_with_str(&format!("FIRE|{:.5}|{:.5}", game.yaw, game.pitch));
             }
         }
-        drop(game);
-        click_lock();
     });
     canvas.add_event_listener_with_callback("click", click.as_ref().unchecked_ref())?;
     click.forget();
@@ -1840,7 +1804,7 @@ fn start() -> Result<(), JsValue> {
         key.forget();
     }
 
-    let frames: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
+    let frames = Rc::new(RefCell::new(None::<Closure<dyn FnMut(f64)>>));
     let next = frames.clone();
     *next.borrow_mut() = Some(Closure::new(move |now| {
         game.borrow_mut().draw(now);
@@ -1854,9 +1818,10 @@ fn start() -> Result<(), JsValue> {
 }
 
 fn load_texture(
-    game: Rc<RefCell<Game>>,
+    game: &Rc<RefCell<Game>>,
     src: &str,
-    assign: fn(&mut Game, WebGlTexture),
+    wrap: u32,
+    assign: impl Fn(&mut Game, WebGlTexture) + 'static,
 ) -> Result<(), JsValue> {
     let image = HtmlImageElement::new()?;
     let loaded_image = image.clone();
@@ -1868,8 +1833,8 @@ fn load_texture(
             gl.bind_texture(Gl::TEXTURE_2D, Some(&texture));
             gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::LINEAR as i32);
             gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::LINEAR as i32);
-            gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE as i32);
-            gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE as i32);
+            gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, wrap as i32);
+            gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, wrap as i32);
             if gl
                 .tex_image_2d_with_u32_and_u32_and_html_image_element(
                     Gl::TEXTURE_2D,

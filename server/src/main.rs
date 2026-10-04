@@ -10,6 +10,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tungstenite::{accept_with_config, protocol::WebSocketConfig, Error, Message};
+// Shared with the client; each side uses only part of it.
+#[allow(dead_code)]
 #[path = "../../src/map.rs"]
 mod map;
 
@@ -190,7 +192,7 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
         .unwrap_or(0)
         ^ (id as u64) << 32;
     let mut rng = Rng::new(seed);
-    let (outgoing, incoming) = mpsc::sync_channel::<String>(32);
+    let (outgoing, incoming) = mpsc::sync_channel::<String>(64);
     let (existing, x, z, y, score, winner) = {
         let mut world = shared.lock().unwrap();
         if world.players.values().any(|player| player.name == name) {
@@ -320,20 +322,23 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                             ) else {
                                 continue;
                             };
-                            // Clients send every 100 ms; a faster sender would flood
+                            // Clients send every 50 ms; a faster sender would flood
                             // everyone else's queue.
                             if ![x, z, feet, yaw].iter().all(|v| v.is_finite())
-                                || last_pos.elapsed() < Duration::from_millis(50)
+                                || last_pos.elapsed() < Duration::from_millis(25)
                             {
                                 continue;
                             }
                             // Checked from the client's own feet, so walking off a
                             // ledge or jumping onto a crate never leaves the server
                             // stuck at an old height.
-                            let Some(y) = map::stand_height(map::Map::Camel, x, z, feet, 0.28)
+                            let Some(floor) = map::stand_height(map::Map::Camel, x, z, feet, 0.28)
                             else {
                                 continue;
                             };
+                            // Up to a jump above the floor, so others see jumps and
+                            // the hitbox follows them.
+                            let y = feet.clamp(floor, floor + 1.0);
                             let mut world = shared.lock().unwrap();
                             let Some(player) = world.players.get_mut(&id) else {
                                 continue;

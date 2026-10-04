@@ -80,13 +80,15 @@ fn faces() -> &'static [Face] {
     FACES.get_or_init(|| {
         let bytes = include_bytes!("../assets/camel_mesh.bin");
         let mut vertices = Vec::with_capacity(bytes.len() / 20);
-        for vertex in bytes.chunks_exact(20) {
+        for vertex in bytes.as_chunks::<20>().0 {
             let coordinate =
                 |i| f32::from_le_bytes(vertex[i..i + 4].try_into().unwrap()) * CAMEL_SCALE;
             vertices.push([coordinate(0), coordinate(4), coordinate(8)]);
         }
         vertices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|v| {
                 let a = sub(v[1], v[0]);
                 let b = sub(v[2], v[0]);
@@ -162,7 +164,7 @@ pub fn floor_at(map: Map, x: f32, z: f32, feet: f32, rise: f32) -> Option<f32> {
                 continue;
             }
             let top = block.center[1] + block.half[1];
-            if top <= feet + rise && floor.map_or(true, |f| top > f) {
+            if top <= feet + rise && floor.is_none_or(|f| top > f) {
                 floor = Some(top);
             }
         }
@@ -182,7 +184,7 @@ pub fn floor_at(map: Map, x: f32, z: f32, feet: f32, rise: f32) -> Option<f32> {
             continue;
         }
         if let Some(y) = floor_y(face, x, z) {
-            if y <= feet + rise && floor.map_or(true, |f| y > f) {
+            if y <= feet + rise && floor.is_none_or(|f| y > f) {
                 floor = Some(y);
             }
         }
