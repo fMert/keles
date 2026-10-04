@@ -2,21 +2,22 @@ use std::{
     collections::HashMap,
     net::{IpAddr, TcpListener, TcpStream},
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
         mpsc::{self, SyncSender},
         Arc, Mutex,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tungstenite::{accept_with_config, protocol::WebSocketConfig, Error, Message};
+use tungstenite::{accept_hdr_with_config, protocol::WebSocketConfig, Error, Message};
 // Shared with the client; each side uses only part of it.
 #[allow(dead_code)]
 #[path = "../../src/map.rs"]
 mod map;
 
 const MAX_PLAYERS: usize = 16;
-// ponytail: players behind one NAT share this; raise it if they do.
+// ponytail: players behind one NAT share this; raise it if they do. Handshakes
+// that never JOIN are only bounded by MAX_PLAYERS threads and the 5 s timeout.
 const MAX_PER_IP: usize = 4;
 const MAX_HEALTH: u8 = 3;
 const WIN_SCORE: u32 = 40;
@@ -30,6 +31,7 @@ struct Player {
     yaw: f32,
     health: u8,
     team: &'static str,
+    ip: IpAddr,
     outgoing: SyncSender<String>,
 }
 
@@ -157,9 +159,25 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
         .max_write_buffer_size(8192)
         .max_message_size(Some(256))
         .max_frame_size(Some(256));
-    let Ok(mut socket) = accept_with_config(stream, Some(config)) else {
+    let Ok(peer) = stream.peer_addr().map(|address| address.ip()) else {
         return;
     };
+    let mut forwarded = None;
+    #[allow(clippy::result_large_err)] // tungstenite fixes the callback signature.
+    let read_forwarded = |request: &tungstenite::handshake::server::Request, response| {
+        forwarded = request.headers().get("x-forwarded-for").cloned();
+        Ok(response)
+    };
+    let Ok(mut socket) = accept_hdr_with_config(stream, read_forwarded, Some(config)) else {
+        return;
+    };
+    // Behind a local proxy such as Caddy in Docker, every peer is the proxy, so
+    // use the address it appends. Direct clients could forge the header.
+    let proxied = peer.is_loopback() || matches!(peer, IpAddr::V4(ip) if ip.is_private());
+    let ip = forwarded
+        .filter(|_| proxied)
+        .and_then(|value| value.to_str().ok()?.rsplit(',').next()?.trim().parse().ok())
+        .unwrap_or(peer);
     let Ok(Message::Text(join)) = socket.read() else {
         return;
     };
@@ -205,6 +223,19 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
             let _ = socket.send(Message::Text("ERROR|Server is full".into()));
             return;
         }
+        if world
+            .players
+            .values()
+            .filter(|player| player.ip == ip)
+            .count()
+            >= MAX_PER_IP
+        {
+            drop(world);
+            let _ = socket.send(Message::Text(
+                "ERROR|Too many players from your address".into(),
+            ));
+            return;
+        }
         let (x, z, y) = team_spawn(team, &mut rng);
         let existing = world
             .players
@@ -232,6 +263,7 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                 yaw: -std::f32::consts::FRAC_PI_2,
                 health: MAX_HEALTH,
                 team,
+                ip,
                 outgoing,
             },
         );
@@ -522,6 +554,7 @@ mod tests {
             yaw: 0.0,
             health: 0,
             team,
+            ip: IpAddr::from([127, 0, 0, 1]),
             outgoing,
         };
         let (sender, receiver) = mpsc::sync_channel(32);
@@ -555,12 +588,6 @@ mod tests {
     }
 }
 
-fn release(open: &Mutex<HashMap<IpAddr, usize>>, ip: IpAddr) {
-    let mut counts = open.lock().unwrap();
-    *counts.get_mut(&ip).unwrap() -= 1;
-    counts.retain(|_, count| *count > 0);
-}
-
 // Listener/thread pattern adapted from snapview/tungstenite-rs/README.md,
 // lines 5-26: https://github.com/snapview/tungstenite-rs/blob/master/README.md
 // License: MIT OR Apache-2.0 (see LICENSE-MIT-tungstenite).
@@ -578,37 +605,26 @@ fn main() -> std::io::Result<()> {
         reset_at: None,
     }));
     let ids = Arc::new(AtomicU32::new(1));
-    let open: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::default();
+    let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
             continue;
         };
-        let Ok(peer) = stream.peer_addr() else {
+        if active.fetch_add(1, Ordering::Relaxed) >= MAX_PLAYERS {
+            active.fetch_sub(1, Ordering::Relaxed);
             continue;
-        };
-        let ip = peer.ip();
-        {
-            let mut counts = open.lock().unwrap();
-            let mine = counts.get(&ip).copied().unwrap_or(0);
-            // A local TLS proxy forwards everyone from loopback, so it is not capped.
-            if counts.values().sum::<usize>() >= MAX_PLAYERS
-                || (!ip.is_loopback() && mine >= MAX_PER_IP)
-            {
-                continue;
-            }
-            counts.insert(ip, mine + 1);
         }
         let shared = shared.clone();
         let ids = ids.clone();
-        let thread_open = open.clone();
+        let active_thread = active.clone();
         if let Err(error) = thread::Builder::new()
             .stack_size(512 * 1024)
             .spawn(move || {
                 handle_client(stream, shared, ids);
-                release(&thread_open, ip);
+                active_thread.fetch_sub(1, Ordering::Relaxed);
             })
         {
-            release(&open, ip);
+            active.fetch_sub(1, Ordering::Relaxed);
             eprintln!("Could not start client thread: {error}");
         }
     }
