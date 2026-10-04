@@ -228,6 +228,7 @@ struct Game {
     girl_texture: Option<WebGlTexture>,
     shot_at: f64,
     position: Vec3,
+    ground: Vec3,
     yaw: f32,
     pitch: f32,
     keys: [bool; 4],
@@ -606,19 +607,13 @@ impl Game {
             if let Some(floor) = floor.filter(|floor| landing <= *floor) {
                 self.position.y = floor + map::EYE_HEIGHT;
                 self.vertical = 0.0;
+                self.ground = self.position;
             } else {
                 self.position.y += self.vertical * dt;
             }
+            // Back to the last floor, which the server also knows, not a fixed spawn.
             if self.position.y < FALL_LIMIT {
-                self.position = if self.map == Map::Camel {
-                    Vec3::new(
-                        map::CAMEL_SPAWN[0],
-                        map::CAMEL_SPAWN[1] + map::EYE_HEIGHT,
-                        map::CAMEL_SPAWN[2],
-                    )
-                } else {
-                    Vec3::new(0.0, map::EYE_HEIGHT, 5.0)
-                };
+                self.position = self.ground;
                 self.vertical = 0.0;
             }
         }
@@ -847,14 +842,9 @@ fn send_join(game: &Rc<RefCell<Game>>) {
     }
 }
 
-fn connect(game: &Rc<RefCell<Game>>) -> Result<(), String> {
-    let (address, name) = {
-        let game = game.borrow();
-        (
-            game.server_input.value().trim().to_owned(),
-            game.nickname_input.value().trim().to_owned(),
-        )
-    };
+fn server_url(game: &Game) -> Result<String, String> {
+    let address = game.server_input.value().trim().to_owned();
+    let name = game.nickname_input.value().trim().to_owned();
     if name.is_empty()
         || name.len() > 16
         || !name
@@ -880,6 +870,11 @@ fn connect(game: &Rc<RefCell<Game>>) -> Result<(), String> {
     if secure_page && url.starts_with("ws://") {
         return Err("Use a wss:// server when the game page uses HTTPS.".to_owned());
     }
+    Ok(url)
+}
+
+fn connect(game: &Rc<RefCell<Game>>, team: Team) -> Result<(), String> {
+    let url = server_url(&game.borrow())?;
     let socket = WebSocket::new(&url).map_err(|_| "Invalid server address.".to_owned())?;
     let session = {
         let mut game = game.borrow_mut();
@@ -892,9 +887,9 @@ fn connect(game: &Rc<RefCell<Game>>) -> Result<(), String> {
         game.socket = Some(socket.clone());
         game.last_sent = 0.0;
         game.joined = false;
-        game.team = None;
+        game.team = Some(team);
         game.refresh_hud();
-        game.show_screen(Screen::Team);
+        game.show_screen(Screen::Playing);
         game.session
     };
 
@@ -1408,6 +1403,7 @@ fn start() -> Result<(), JsValue> {
         girl_texture: None,
         shot_at: f64::NEG_INFINITY,
         position: Vec3::new(0.0, 1.7, 5.0),
+        ground: Vec3::new(0.0, 1.7, 5.0),
         yaw: -std::f32::consts::FRAC_PI_2,
         pitch: 0.0,
         keys: [false; 4],
@@ -1643,18 +1639,21 @@ fn start() -> Result<(), JsValue> {
         let button_lock = lock_pointer.clone();
         let action = Closure::<dyn FnMut()>::new(move || {
             if button_game.borrow().screen == Screen::Join && index == 0 {
-                if let Err(error) = connect(&button_game) {
-                    button_game.borrow().status.set_inner_text(&error);
+                let checked = server_url(&button_game.borrow());
+                match checked {
+                    Ok(_) => button_game.borrow_mut().show_screen(Screen::Team),
+                    Err(error) => button_game.borrow().status.set_inner_text(&error),
                 }
                 return;
             }
             if button_game.borrow().screen == Screen::Team && index < 2 {
-                {
+                let team = if index == 0 { Team::Boys } else { Team::Girls };
+                if let Err(error) = connect(&button_game, team) {
                     let mut game = button_game.borrow_mut();
-                    game.team = Some(if index == 0 { Team::Boys } else { Team::Girls });
-                    game.show_screen(Screen::Playing);
+                    game.status.set_inner_text(&error);
+                    game.show_screen(Screen::Join);
+                    return;
                 }
-                send_join(&button_game);
                 button_lock();
                 return;
             }
@@ -1698,6 +1697,7 @@ fn start() -> Result<(), JsValue> {
                 }
                 (Screen::MapSelect, 2) => Screen::Modes,
                 (Screen::Join, 1) => Screen::Modes,
+                (Screen::Paused, 0) if game.health == 0 => Screen::Dead,
                 (Screen::Paused, 0) => Screen::Playing,
                 (Screen::Paused, 1) => Screen::SettingsPaused,
                 (Screen::Paused, 2) => {
@@ -1736,10 +1736,7 @@ fn start() -> Result<(), JsValue> {
         game.shot_at = game.last_frame;
         if game.connected {
             if let Some(socket) = &game.socket {
-                let _ = socket.send_with_str(&format!(
-                    "FIRE|{:.3}|{:.3}|{:.5}|{:.5}",
-                    game.position.x, game.position.z, game.yaw, game.pitch
-                ));
+                let _ = socket.send_with_str(&format!("FIRE|{:.5}|{:.5}", game.yaw, game.pitch));
             }
         }
         drop(game);

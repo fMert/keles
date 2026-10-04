@@ -1,8 +1,8 @@
 use std::{
     collections::HashMap,
-    net::{TcpListener, TcpStream},
+    net::{IpAddr, TcpListener, TcpStream},
     sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicU32, Ordering},
         mpsc::{self, SyncSender},
         Arc, Mutex,
     },
@@ -14,6 +14,8 @@ use tungstenite::{accept_with_config, protocol::WebSocketConfig, Error, Message}
 mod map;
 
 const MAX_PLAYERS: usize = 16;
+// ponytail: players behind one NAT share this; raise it if they do.
+const MAX_PER_IP: usize = 4;
 const MAX_HEALTH: u8 = 3;
 const WIN_SCORE: u32 = 40;
 const ROUND_RESET: Duration = Duration::from_secs(10);
@@ -156,8 +158,6 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
     let Ok(mut socket) = accept_with_config(stream, Some(config)) else {
         return;
     };
-    // The handshake keeps the 5 s limit; JOIN waits while the player picks a team.
-    let _ = socket.get_mut().set_read_timeout(None);
     let Ok(Message::Text(join)) = socket.read() else {
         return;
     };
@@ -276,13 +276,29 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
     if ready {
         let mut last_fire = Instant::now() - Duration::from_secs(1);
         let mut last_pos = last_fire;
+        let (mut last_heard, mut last_ping) = (Instant::now(), Instant::now());
         'connected: loop {
+            // Browsers answer pings on their own, even while paused, so silence
+            // means a dead link that would otherwise keep the slot and nickname.
+            if last_heard.elapsed() > Duration::from_secs(15) {
+                break;
+            }
+            if last_ping.elapsed() > Duration::from_secs(5) {
+                last_ping = Instant::now();
+                if socket.send(Message::Ping(Default::default())).is_err() {
+                    break;
+                }
+            }
             while let Ok(message) = incoming.try_recv() {
                 if socket.send(Message::Text(message.into())).is_err() {
                     break 'connected;
                 }
             }
-            match socket.read() {
+            let read = socket.read();
+            if read.is_ok() {
+                last_heard = Instant::now();
+            }
+            match read {
                 Ok(Message::Text(text)) => {
                     let mut fields = text.split('|');
                     match fields.next() {
@@ -318,14 +334,18 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                             else {
                                 continue;
                             };
-                            last_pos = Instant::now();
                             let mut world = shared.lock().unwrap();
                             let Some(player) = world.players.get_mut(&id) else {
                                 continue;
                             };
-                            if player.health == 0 {
+                            // Walking speed is 4 m/s; the extra metre covers jitter.
+                            // ponytail: standing still banks travel time; send position
+                            // corrections if that is ever abused.
+                            let reach = 4.0 * last_pos.elapsed().as_secs_f32() + 1.0;
+                            if player.health == 0 || (x - player.x).hypot(z - player.z) > reach {
                                 continue;
                             }
+                            last_pos = Instant::now();
                             player.x = x;
                             player.z = z;
                             player.y = y;
@@ -337,26 +357,20 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                             );
                         }
                         Some("FIRE") => {
-                            let (Some(x), Some(z), Some(yaw), Some(pitch), None) = (
-                                fields.next(),
-                                fields.next(),
-                                fields.next(),
-                                fields.next(),
-                                fields.next(),
-                            ) else {
+                            let (Some(yaw), Some(pitch), None) =
+                                (fields.next(), fields.next(), fields.next())
+                            else {
                                 continue;
                             };
-                            let (Ok(x), Ok(z), Ok(yaw), Ok(pitch)) = (
-                                x.parse::<f32>(),
-                                z.parse::<f32>(),
-                                yaw.parse::<f32>(),
-                                pitch.parse::<f32>(),
-                            ) else {
+                            let (Ok(yaw), Ok(pitch)) = (yaw.parse::<f32>(), pitch.parse::<f32>())
+                            else {
                                 continue;
                             };
-                            if ![x, z, yaw, pitch].iter().all(|v| v.is_finite())
+                            // The client waits 500 ms; the margin absorbs network jitter.
+                            if !yaw.is_finite()
+                                || !pitch.is_finite()
                                 || pitch.abs() > 1.5
-                                || last_fire.elapsed() < Duration::from_millis(500)
+                                || last_fire.elapsed() < Duration::from_millis(450)
                             {
                                 continue;
                             }
@@ -371,11 +385,11 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                             else {
                                 continue;
                             };
-                            if (x - sx).abs() > 1.0 || (z - sz).abs() > 1.0 || health == 0 {
+                            if health == 0 {
                                 continue;
                             }
                             last_fire = Instant::now();
-                            let origin = [x, sy + 1.7, z];
+                            let origin = [sx, sy + 1.7, sz];
                             let direction = [
                                 yaw.cos() * pitch.cos(),
                                 pitch.sin(),
@@ -536,6 +550,12 @@ mod tests {
     }
 }
 
+fn release(open: &Mutex<HashMap<IpAddr, usize>>, ip: IpAddr) {
+    let mut counts = open.lock().unwrap();
+    *counts.get_mut(&ip).unwrap() -= 1;
+    counts.retain(|_, count| *count > 0);
+}
+
 // Listener/thread pattern adapted from snapview/tungstenite-rs/README.md,
 // lines 5-26: https://github.com/snapview/tungstenite-rs/blob/master/README.md
 // License: MIT OR Apache-2.0 (see LICENSE-MIT-tungstenite).
@@ -553,26 +573,37 @@ fn main() -> std::io::Result<()> {
         reset_at: None,
     }));
     let ids = Arc::new(AtomicU32::new(1));
-    let active = Arc::new(AtomicUsize::new(0));
+    let open: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::default();
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
             continue;
         };
-        if active.fetch_add(1, Ordering::Relaxed) >= MAX_PLAYERS {
-            active.fetch_sub(1, Ordering::Relaxed);
+        let Ok(peer) = stream.peer_addr() else {
             continue;
+        };
+        let ip = peer.ip();
+        {
+            let mut counts = open.lock().unwrap();
+            let mine = counts.get(&ip).copied().unwrap_or(0);
+            // A local TLS proxy forwards everyone from loopback, so it is not capped.
+            if counts.values().sum::<usize>() >= MAX_PLAYERS
+                || (!ip.is_loopback() && mine >= MAX_PER_IP)
+            {
+                continue;
+            }
+            counts.insert(ip, mine + 1);
         }
         let shared = shared.clone();
         let ids = ids.clone();
-        let active_thread = active.clone();
+        let thread_open = open.clone();
         if let Err(error) = thread::Builder::new()
             .stack_size(512 * 1024)
             .spawn(move || {
                 handle_client(stream, shared, ids);
-                active_thread.fetch_sub(1, Ordering::Relaxed);
+                release(&thread_open, ip);
             })
         {
-            active.fetch_sub(1, Ordering::Relaxed);
+            release(&open, ip);
             eprintln!("Could not start client thread: {error}");
         }
     }
