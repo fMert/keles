@@ -1,6 +1,6 @@
 [package]
 name = "keles"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Keles multiplayer FPS"
@@ -9,6 +9,8 @@ repository = "https://github.com/fMert/keles"
 [dependencies]
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "wayland", "x11"] }
 ewebsock = { version = "0.8.0", features = ["tls"] }
+# ewebsock's TLS dependency enables no rustls crypto provider on its own.
+rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
 glam = "0.33.12"
 image = { version = "0.25.6", default-features = false, features = ["png"] }
 

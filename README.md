@@ -9,10 +9,10 @@ executable; single player works offline.
 
 Downloads are on [GitHub Releases](https://github.com/fMert/keles/releases).
 The Linux amd64 `.deb` targets Debian 13 or a compatible newer distribution:
-install with `sudo apt install ./keles-desktop_0.3.0_amd64.deb`, then launch
+install with `sudo apt install ./keles-desktop_0.3.1_amd64.deb`, then launch
 **Keles** from the application menu or run `keles`. APT installs the system
 OpenGL, X11/Wayland and DejaVu font packages it needs. The Windows x64
-executable is portable: double-click `keles-0.3.0-windows-x64.exe`. It needs
+executable is portable: double-click `keles-0.3.1-windows-x64.exe`. It needs
 only Windows' own OpenGL driver and Segoe UI font; the MSVC runtime is
 included. Keep the release's `LICENSE` and `THIRD-PARTY-LICENSES.txt` with
 the Windows executable when redistributing it. The Debian package includes
@@ -25,7 +25,7 @@ Build and run from the project root:
 sudo apt install build-essential
 cargo run --release
 cargo install cargo-deb --locked
-cargo deb --locked --output dist/keles-desktop_0.3.0_amd64.deb
+cargo deb --locked --output dist/keles-desktop_0.3.1_amd64.deb
 ```
 
 The Windows x64 executable can be cross-compiled from Linux with
@@ -91,6 +91,9 @@ rendering and the Openbox window manager: menus, both maps, WASD, raw mouse
 look, shooting, pause, fullscreen, windowed and fullscreen resolution changes
 and the 60 FPS, 144 FPS and unlimited limits worked. The Windows executable
 was cross-compiled and imports only system DLLs; it was not run on Windows.
+
+Release 0.3.1 enables rustls's `ring` crypto provider for native `wss://`
+connections. A live connection to `wss://fmert.me/keles` received `WELCOME`.
 
 Run the small multiplayer relay locally or on a VPS:
 
