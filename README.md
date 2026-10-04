@@ -8,10 +8,11 @@ or `wss://` address in **Play → Multiplayer** as before.
 
 Desktop downloads are on [GitHub Releases](https://github.com/fMert/keles/releases).
 The Linux amd64 `.deb` targets Debian 13 or a compatible newer distribution:
-install with `sudo apt install ./keles-desktop_0.2.0_amd64.deb`, then launch
+install with `sudo apt install ./keles-desktop_0.2.1_amd64.deb`, then launch
 **Keles** from the application menu or run `keles`. APT installs the required
-GTK/WebKitGTK runtime dependencies. The Windows x64 executable is portable:
-double-click `keles-0.2.0-windows-x64.exe`. Windows 10/11 requires the
+system runtime dependencies. Linux bundles Chromium Embedded Framework (CEF);
+Windows uses the system's Chromium-based WebView2. The Windows x64 executable is portable:
+double-click `keles-0.2.1-windows-x64.exe`. Windows 10/11 requires the
 [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/),
 which is usually already installed. The executable includes the MSVC runtime.
 Keep the release's `LICENSE` and `THIRD-PARTY-LICENSES.txt` with the Windows
@@ -22,12 +23,14 @@ Build the desktop client after rebuilding WASM from the project root:
 ```sh
 wasm-pack build --target web --release
 # Linux build prerequisites (Debian/Ubuntu):
-sudo apt install build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libdbus-1-dev
-cargo run --locked --manifest-path desktop/Cargo.toml
+sudo apt install build-essential cmake libx11-dev
+cargo run --locked --manifest-path desktop/Cargo.toml -- --disable-setuid-sandbox
 cargo test --locked --manifest-path desktop/Cargo.toml
 cargo install cargo-deb --locked
 cd desktop
-cargo deb --locked --output ../dist/keles-desktop_0.2.0_amd64.deb
+cargo build --locked --release
+strip --strip-unneeded target/release/libcef.so
+cargo deb --locked --no-build --output ../dist/keles-desktop_0.2.1_amd64.deb
 ```
 
 On Windows, install Rust with the MSVC toolchain and Visual Studio C++ build
@@ -42,6 +45,15 @@ From Linux, the same command can use `cargo xwin build` after installing
 [cargo-xwin](https://github.com/rust-cross/cargo-xwin), Clang and LLD, and
 running `rustup target add x86_64-pc-windows-msvc`.
 WASM must be rebuilt **before** each desktop build so the embedded client is current.
+The Linux build downloads the matching CEF runtime automatically. Its shared
+library, resources, sandbox helper and licenses must accompany the executable;
+`cargo deb` packages them. The Rust client remains embedded. No local HTTP
+server is started: CEF serves `http://keles.localhost/` from embedded bytes.
+This loopback origin supports pointer lock and existing `ws://` servers.
+Mouse capture and local/loopback network permissions are allowed only for this
+embedded game origin; other permission requests are denied. The development
+command above uses Chromium's namespace sandbox without a root-owned helper;
+the installed package uses its root-owned setuid sandbox helper.
 
 Desktop source borrowing (all from Wry v0.57.0, commit
 `792d0359ba6501a4fc360ece17de2ae42329a47c`, MIT):
@@ -49,7 +61,7 @@ Desktop source borrowing (all from Wry v0.57.0, commit
 | Repository | Exact source | Adaptation |
 | --- | --- | --- |
 | [tauri-apps/wry](https://github.com/tauri-apps/wry) | [`examples/custom_protocol.rs`, `get_wry_response`, lines 73–101](https://github.com/tauri-apps/wry/blob/792d0359ba6501a4fc360ece17de2ae42329a47c/examples/custom_protocol.rs#L73) | Asset path, MIME and response handling; embedded bytes replace filesystem reads, missing paths return 404. |
-| [tauri-apps/wry](https://github.com/tauri-apps/wry) | [`examples/custom_protocol.rs`, `main`, lines 17–24 and 34–67](https://github.com/tauri-apps/wry/blob/792d0359ba6501a4fc360ece17de2ae42329a47c/examples/custom_protocol.rs#L17) | Native window, custom protocol, GTK integration and close event loop. |
+| [tauri-apps/wry](https://github.com/tauri-apps/wry) | [`examples/custom_protocol.rs`, `main`, lines 17–24 and 34–67](https://github.com/tauri-apps/wry/blob/792d0359ba6501a4fc360ece17de2ae42329a47c/examples/custom_protocol.rs#L17) | Windows native window, custom protocol and close event loop. |
 
 Wry meets the project quality bar: it is Tauri's production webview library,
 with over 1,000 commits, over 100 contributors, CI, maintained examples,
@@ -60,6 +72,39 @@ Tauri's maintained windowing library, with CI and over 100 contributors;
 [include_dir](https://github.com/Michael-F-Bryan/include_dir) (MIT) has existed
 since 2017, with over 200 commits, 14 contributors, tests and examples. No
 implementation snippets were copied from these two dependencies.
+
+Linux process setup and window creation are adapted from
+[tauri-apps/cef-rs](https://github.com/tauri-apps/cef-rs), commit
+`f044f89e561237033435743e5dbcbf486d0d10a9`, MIT:
+[`examples/cefsimple/src/shared/mod.rs`, lines 26–27 and 36–74](https://github.com/tauri-apps/cef-rs/blob/f044f89e561237033435743e5dbcbf486d0d10a9/examples/cefsimple/src/shared/mod.rs#L36),
+and [`shared/simple_app.rs`, lines 6–64, 66–73, 93–95, 156–166 and 182–188](https://github.com/tauri-apps/cef-rs/blob/f044f89e561237033435743e5dbcbf486d0d10a9/examples/cefsimple/src/shared/simple_app.rs#L6).
+Only those setup snippets are adapted; asset streams and permissions use public
+CEF APIs. The source includes a borrowing comment and `desktop/LICENSE-MIT-CEF-Rust`.
+This is Tauri's maintained Rust CEF integration, with over 1,100 commits, 27
+contributors, CI, runnable examples, a security policy and reviewed issues/PRs.
+CEF itself is the established BSD-licensed Chromium embedding framework.
+The window uses CEF Views with Chrome runtime style and no toolbar: Alloy style
+rejected pointer lock with `UnknownError` on this machine. Only the English CEF
+locale and the standard runtime files are packaged; debug symbols are removed.
+
+The 0.2.0 Linux wrapper could run at 62 FPS on a 165 Hz NVIDIA/X11 display.
+WebKit's GPU diagnostic reported a 60 Hz timer rather than hardware vblank,
+and disabled accelerated compositing. Its fallback sleeps `1000 / 60` integer
+milliseconds (16 ms), explaining the observed 62.5 FPS and uneven presentation
+on a 165 Hz screen. Disabling its 60 FPS preference and requesting acceleration
+did not fix this machine. Release 0.2.1 replaces the Linux WebKit engine with
+CEF rather than changing the game's render loop or reporting artificial FPS.
+The [WebKit timer implementation](https://github.com/WebKit/WebKit/blob/webkitgtk-2.52.6/Source/WebKit/UIProcess/glib/DisplayVBlankMonitorTimer.cpp)
+documents that fallback.
+
+Release 0.2.1 was checked on the actual NVIDIA/X11 165 Hz display: CEF ran
+at 165 FPS, and the owner confirmed mouse capture and camera movement worked.
+Pause/resume, nickname entry, local WebSocket connection and team selection
+were also checked with the CEF client.
+Raw input (`unadjustedMovement`) was rejected in this Linux environment;
+leave it disabled to use normal mouse capture. The embedded asset and scoped
+permission tests and desktop Clippy checks passed. Windows was rebuilt with
+the same embedded client; Windows runtime behavior remains untested here.
 
 Release 0.2.0 validation: the Linux application was run on a separate virtual
 display with Mesa software rendering. Both maps, WASD, mouse capture/look,

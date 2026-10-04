@@ -1,13 +1,24 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+use http::Response;
 use include_dir::{include_dir, Dir};
+#[cfg(target_os = "windows")]
 use tao::{
     dpi::LogicalSize,
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
-use wry::{http::Response, PermissionKind, PermissionResponse, WebViewBuilder};
+#[cfg(target_os = "windows")]
+use wry::{PermissionKind, PermissionResponse, WebViewBuilder};
+
+#[cfg(target_os = "linux")]
+mod linux;
+
+#[cfg(target_os = "linux")]
+fn main() {
+    linux::run();
+}
 
 static PKG: Dir = include_dir!("$CARGO_MANIFEST_DIR/../pkg");
 static TEXTURES: Dir = include_dir!("$CARGO_MANIFEST_DIR/../assets/camel_images");
@@ -61,6 +72,7 @@ fn asset_response(path: &str) -> Response<Vec<u8>> {
 // Adapted from tauri-apps/wry, examples/custom_protocol.rs, lines 17-24, 34-67.
 // https://github.com/tauri-apps/wry/blob/792d0359ba6501a4fc360ece17de2ae42329a47c/examples/custom_protocol.rs#L17
 // License: MIT (see ../LICENSE-MIT-Wry). Uses the existing game and grants mouse capture only.
+#[cfg(target_os = "windows")]
 fn main() -> wry::Result<()> {
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
@@ -77,14 +89,7 @@ fn main() -> wry::Result<()> {
             _ => PermissionResponse::Deny,
         })
         .with_url("keles://localhost/");
-    #[cfg(target_os = "windows")]
     let _webview = builder.build(&window)?;
-    #[cfg(target_os = "linux")]
-    let _webview = {
-        use tao::platform::unix::WindowExtUnix;
-        use wry::WebViewBuilderExtUnix;
-        builder.build_gtk(window.default_vbox().unwrap())?
-    };
     event_loop.run(move |event, _, control_flow| {
         // Keep the window and WebView alive until the event loop exits.
         let _ = (&window, &_webview);
