@@ -626,8 +626,11 @@ impl Game {
             if let Some(socket) = &self.socket {
                 if socket.ready_state() == WebSocket::OPEN {
                     let _ = socket.send_with_str(&format!(
-                        "POS|{:.3}|{:.3}|{:.3}",
-                        self.position.x, self.position.z, self.yaw
+                        "POS|{:.3}|{:.3}|{:.3}|{:.3}",
+                        self.position.x,
+                        self.position.z,
+                        self.position.y - map::EYE_HEIGHT,
+                        self.yaw
                     ));
                     self.last_sent = now;
                 }
@@ -969,6 +972,9 @@ fn connect(game: &Rc<RefCell<Game>>) -> Result<(), String> {
                         game.position = Vec3::new(x, y + map::EYE_HEIGHT, z);
                         game.vertical = 0.0;
                         game.shot_at = f64::NEG_INFINITY;
+                        // AT also starts a new round, so a past win must not block
+                        // the death screen.
+                        game.winner = None;
                         game.show_screen(Screen::Playing);
                     }
                 }
@@ -1024,23 +1030,26 @@ fn connect(game: &Rc<RefCell<Game>>) -> Result<(), String> {
                 }
             }
             Some("MOVE") => {
-                let (Some(id), Some(x), Some(z), Some(yaw)) =
-                    (parts.next(), parts.next(), parts.next(), parts.next())
-                else {
+                let (Some(id), Some(x), Some(z), Some(y), Some(yaw)) = (
+                    parts.next(),
+                    parts.next(),
+                    parts.next(),
+                    parts.next(),
+                    parts.next(),
+                ) else {
                     return;
                 };
-                if let (Ok(id), Ok(x), Ok(z), Ok(yaw)) = (
+                if let (Ok(id), Ok(x), Ok(z), Ok(y), Ok(yaw)) = (
                     id.parse::<u32>(),
                     x.parse::<f32>(),
                     z.parse::<f32>(),
+                    y.parse::<f32>(),
                     yaw.parse::<f32>(),
                 ) {
                     if let Some(player) = game.remote.get_mut(&id) {
-                        if let Some(floor) = map::stand_height(Map::Camel, x, z, player.y, 0.0) {
-                            player.y = floor;
-                        }
                         player.x = x;
                         player.z = z;
+                        player.y = y;
                         player.yaw = yaw;
                     }
                 }

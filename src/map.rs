@@ -226,14 +226,11 @@ pub fn wall_blocked(map: Map, x: f32, z: f32, feet: f32, radius: f32) -> bool {
     false
 }
 
-// Server-side move check: the floor within reach of `current`, or None if a
-// wall blocks it or the drop is too large to be a walk.
+// Server-side move check: the floor below feet at `current` (which may be mid
+// jump or fall), or None if a wall blocks it.
 pub fn stand_height(map: Map, x: f32, z: f32, current: f32, radius: f32) -> Option<f32> {
     let floor = floor_at(map, x, z, current, STEP_UP)?;
-    if wall_blocked(map, x, z, current, radius) || (floor - current).abs() > 1.25 {
-        return None;
-    }
-    Some(floor)
+    (!wall_blocked(map, x, z, current, radius)).then_some(floor)
 }
 
 pub fn ray_map(origin: [f32; 3], direction: [f32; 3]) -> f32 {
@@ -282,6 +279,12 @@ mod tests {
         let [x, y, z] = CAMEL_SPAWN;
         let floor = floor_at(Map::Camel, x, z, y, STEP_UP).expect("spawn has a floor");
         assert!((floor - y).abs() < 0.5, "spawn floor {floor} vs {y}");
+    }
+
+    #[test]
+    fn walking_off_a_ledge_is_a_valid_move() {
+        // Feet still at the terrace height, about 2.8 m above the floor below.
+        assert!(stand_height(Map::Camel, -24.6, 22.3, 6.57, 0.28).is_some());
     }
 
     #[test]

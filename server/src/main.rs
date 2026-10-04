@@ -78,12 +78,11 @@ fn team_spawn(team: &str, rng: &mut Rng) -> (f32, f32, f32) {
     ((area[0] + area[2]) * 0.5, (area[1] + area[3]) * 0.5, floor)
 }
 
-fn broadcast(players: &HashMap<u32, Player>, except: u32, message: &str) {
-    for (&id, player) in players {
-        if id != except {
-            let _ = player.outgoing.try_send(message.to_owned());
-        }
-    }
+// A client whose queue is full has fallen behind; dropping it beats letting it
+// miss state such as HP, SCORE or LEAVE.
+fn broadcast(players: &mut HashMap<u32, Player>, except: u32, message: &str) {
+    players
+        .retain(|&id, player| id == except || player.outgoing.try_send(message.to_owned()).is_ok());
 }
 
 // Called from every connection loop; the first thread to see the deadline
@@ -108,13 +107,17 @@ fn maybe_reset(world: &mut World, rng: &mut Rng) {
         player.yaw = -std::f32::consts::FRAC_PI_2;
         player.health = MAX_HEALTH;
         let _ = player.outgoing.try_send(format!("AT|{x}|{y}|{z}"));
-        let _ = player.outgoing.try_send(format!("HP|{id}|{MAX_HEALTH}"));
-        moves.push((id, x, z));
+        moves.push((id, x, z, y));
     }
-    for (id, x, z) in moves {
-        broadcast(&world.players, id, &format!("MOVE|{id}|{x}|{z}|-1.5707964"));
+    for (id, x, z, y) in moves {
+        broadcast(&mut world.players, 0, &format!("HP|{id}|{MAX_HEALTH}"));
+        broadcast(
+            &mut world.players,
+            id,
+            &format!("MOVE|{id}|{x}|{z}|{y}|-1.5707964"),
+        );
     }
-    broadcast(&world.players, 0, "SCORE|0|0");
+    broadcast(&mut world.players, 0, "SCORE|0|0");
 }
 
 // Adapted from aevyrie/bevy_mod_raycast/src/primitives.rs, intersects_aabb,
@@ -153,6 +156,8 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
     let Ok(mut socket) = accept_with_config(stream, Some(config)) else {
         return;
     };
+    // The handshake keeps the 5 s limit; JOIN waits while the player picks a team.
+    let _ = socket.get_mut().set_read_timeout(None);
     let Ok(Message::Text(join)) = socket.read() else {
         return;
     };
@@ -229,7 +234,7 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
             },
         );
         broadcast(
-            &world.players,
+            &mut world.players,
             id,
             &format!("ADD|{id}|{name}|{x}|{z}|{y}|-1.5707964|{MAX_HEALTH}|{team}"),
         );
@@ -270,6 +275,7 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
 
     if ready {
         let mut last_fire = Instant::now() - Duration::from_secs(1);
+        let mut last_pos = last_fire;
         'connected: loop {
             while let Ok(message) = incoming.try_recv() {
                 if socket.send(Message::Text(message.into())).is_err() {
@@ -281,35 +287,54 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                     let mut fields = text.split('|');
                     match fields.next() {
                         Some("POS") => {
-                            let (Some(x), Some(z), Some(yaw), None) =
-                                (fields.next(), fields.next(), fields.next(), fields.next())
-                            else {
+                            let (Some(x), Some(z), Some(feet), Some(yaw), None) = (
+                                fields.next(),
+                                fields.next(),
+                                fields.next(),
+                                fields.next(),
+                                fields.next(),
+                            ) else {
                                 continue;
                             };
-                            let (Ok(x), Ok(z), Ok(yaw)) =
-                                (x.parse::<f32>(), z.parse::<f32>(), yaw.parse::<f32>())
-                            else {
+                            let (Ok(x), Ok(z), Ok(feet), Ok(yaw)) = (
+                                x.parse::<f32>(),
+                                z.parse::<f32>(),
+                                feet.parse::<f32>(),
+                                yaw.parse::<f32>(),
+                            ) else {
                                 continue;
                             };
-                            if !x.is_finite() || !z.is_finite() || !yaw.is_finite() {
+                            // Clients send every 100 ms; a faster sender would flood
+                            // everyone else's queue.
+                            if ![x, z, feet, yaw].iter().all(|v| v.is_finite())
+                                || last_pos.elapsed() < Duration::from_millis(50)
+                            {
                                 continue;
                             }
+                            // Checked from the client's own feet, so walking off a
+                            // ledge or jumping onto a crate never leaves the server
+                            // stuck at an old height.
+                            let Some(y) = map::stand_height(map::Map::Camel, x, z, feet, 0.28)
+                            else {
+                                continue;
+                            };
+                            last_pos = Instant::now();
                             let mut world = shared.lock().unwrap();
-                            if let Some(player) = world.players.get_mut(&id) {
-                                if player.health == 0 {
-                                    continue;
-                                }
-                                let Some(y) =
-                                    map::stand_height(map::Map::Camel, x, z, player.y, 0.28)
-                                else {
-                                    continue;
-                                };
-                                player.x = x;
-                                player.z = z;
-                                player.y = y;
-                                player.yaw = yaw;
+                            let Some(player) = world.players.get_mut(&id) else {
+                                continue;
+                            };
+                            if player.health == 0 {
+                                continue;
                             }
-                            broadcast(&world.players, id, &format!("MOVE|{id}|{x}|{z}|{yaw}"));
+                            player.x = x;
+                            player.z = z;
+                            player.y = y;
+                            player.yaw = yaw;
+                            broadcast(
+                                &mut world.players,
+                                id,
+                                &format!("MOVE|{id}|{x}|{z}|{y}|{yaw}"),
+                            );
                         }
                         Some("FIRE") => {
                             let (Some(x), Some(z), Some(yaw), Some(pitch), None) = (
@@ -381,7 +406,7 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                                     target.health
                                 };
                                 broadcast(
-                                    &world.players,
+                                    &mut world.players,
                                     0,
                                     &format!("HP|{target_id}|{target_health}"),
                                 );
@@ -392,14 +417,18 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                                         world.boys += 1;
                                     }
                                     let (boys, girls) = (world.boys, world.girls);
-                                    broadcast(&world.players, 0, &format!("SCORE|{boys}|{girls}"));
+                                    broadcast(
+                                        &mut world.players,
+                                        0,
+                                        &format!("SCORE|{boys}|{girls}"),
+                                    );
                                     if boys >= WIN_SCORE || girls >= WIN_SCORE {
                                         let winner =
                                             if boys >= WIN_SCORE { "boys" } else { "girls" };
                                         world.winner = Some(winner);
                                         world.reset_at = Some(Instant::now() + ROUND_RESET);
                                         broadcast(
-                                            &world.players,
+                                            &mut world.players,
                                             0,
                                             &format!("WIN|{winner}|{}", ROUND_RESET.as_secs()),
                                         );
@@ -429,8 +458,12 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                                 player.health = MAX_HEALTH;
                                 let _ = player.outgoing.try_send(format!("AT|{x}|{y}|{z}"));
                             }
-                            broadcast(&world.players, 0, &format!("HP|{id}|{MAX_HEALTH}"));
-                            broadcast(&world.players, id, &format!("MOVE|{id}|{x}|{z}|-1.5707964"));
+                            broadcast(&mut world.players, 0, &format!("HP|{id}|{MAX_HEALTH}"));
+                            broadcast(
+                                &mut world.players,
+                                id,
+                                &format!("MOVE|{id}|{x}|{z}|{y}|-1.5707964"),
+                            );
                         }
                         _ => {}
                     }
@@ -445,12 +478,15 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                 _ => {}
             }
             let mut world = shared.lock().unwrap();
+            if !world.players.contains_key(&id) {
+                break;
+            }
             maybe_reset(&mut world, &mut rng);
         }
     }
     let mut world = shared.lock().unwrap();
     world.players.remove(&id);
-    broadcast(&world.players, id, &format!("LEAVE|{id}"));
+    broadcast(&mut world.players, id, &format!("LEAVE|{id}"));
 }
 
 #[cfg(test)]
@@ -459,23 +495,25 @@ mod tests {
 
     #[test]
     fn reset_clears_scores_and_respawns_everyone() {
+        let player = |team, outgoing| Player {
+            name: String::new(),
+            x: 0.0,
+            z: 0.0,
+            y: 0.0,
+            yaw: 0.0,
+            health: 0,
+            team,
+            outgoing,
+        };
         let (sender, receiver) = mpsc::sync_channel(32);
-        let mut players = HashMap::new();
-        players.insert(
-            1,
-            Player {
-                name: "a".to_owned(),
-                x: 0.0,
-                z: 0.0,
-                y: 0.0,
-                yaw: 0.0,
-                health: 0,
-                team: "girls",
-                outgoing: sender,
-            },
-        );
+        let (other_sender, other_receiver) = mpsc::sync_channel(32);
+        let (full_sender, _full_receiver) = mpsc::sync_channel(0);
         let mut world = World {
-            players,
+            players: HashMap::from([
+                (1, player("girls", sender)),
+                (2, player("boys", other_sender)),
+                (3, player("boys", full_sender)),
+            ]),
             boys: 39,
             girls: 40,
             winner: Some("girls"),
@@ -485,15 +523,16 @@ mod tests {
         maybe_reset(&mut world, &mut rng);
         assert_eq!((world.boys, world.girls), (0, 0));
         assert!(world.winner.is_none() && world.reset_at.is_none());
-        let player = world.players.get(&1).unwrap();
-        assert_eq!(player.health, MAX_HEALTH);
-        let mut messages = Vec::new();
-        while let Ok(message) = receiver.try_recv() {
-            messages.push(message);
-        }
+        assert_eq!(world.players[&1].health, MAX_HEALTH);
+        assert!(
+            !world.players.contains_key(&3),
+            "a full queue drops the client"
+        );
+        let messages = receiver.try_iter().collect::<Vec<_>>();
         assert!(messages.iter().any(|m| m.starts_with("AT|")));
-        assert!(messages.iter().any(|m| m == "HP|1|3"));
         assert!(messages.iter().any(|m| m == "SCORE|0|0"));
+        // Other players must see the revived player again.
+        assert!(other_receiver.try_iter().any(|m| m == "HP|1|3"));
     }
 }
 
