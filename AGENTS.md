@@ -6,7 +6,10 @@ unless the owner explicitly changes them.
 
 ## Goal and initial scope
 
-- Build an extremely lightweight, extremely simple browser FPS foundation.
+- Build an extremely lightweight, extremely simple FPS foundation. It began
+  as a browser game; in release 0.3.0 the owner dropped the web version. The
+  game is now a native desktop program (Linux and Windows) with no browser
+  engine, web view or WASM.
 - The initial scene is three-dimensional: one ground plane and a few simple
   colored, low-poly boxes or obstacles.
 - The player moves with WASD and looks around with the mouse.
@@ -18,13 +21,11 @@ unless the owner explicitly changes them.
 
 ## Non-negotiable implementation constraints
 
-1. Do not author JavaScript, directly or indirectly, for the browser. The
-   automatically generated wasm-bindgen glue is the sole JavaScript exception.
-   A minimal hand-written HTML page may invoke that generated loader through a
-   `type="module"` script, as the owner explicitly allowed.
+1. Do not author JavaScript, directly or indirectly. Do not render through
+   Chromium, WebKit or any other browser engine; the owner rejected both.
 2. All implementation code authored by an agent must be pure Rust. Borrowed
    source may originate in C, C++, Zig, Odin, or another language if it can be
-   compiled to WASM, linked, ported cleanly, or used as a reference; any code
+   compiled, linked, ported cleanly, or used as a reference; any code
    the agent writes or ports must still be Rust.
 3. Keep the code extremely simple. Avoid unnecessary abstractions, traits,
    modules, and files. Prefer one Rust file or very few files.
@@ -58,23 +59,18 @@ unless the owner explicitly changes them.
 
 ## Prefer existing tools and libraries
 
-- Use wasm-bindgen or wasm-pack for WebAssembly compilation instead of building
-  that tooling.
-- Use `web-sys` for browser canvas, WebGL, window, and input event bindings;
-  do not write JavaScript for them.
+- Use eframe (winit + glutin) for the window, input and OpenGL context, and
+  egui for menus and the HUD; do not write windowing or UI toolkits.
 - Use a mature math crate such as `glam` or `nalgebra`; do not write a matrix
   library.
-- Render through WebGL2 or WebGPU from Rust. Evaluate an established
-  open-source crate for the render pipeline first. If `wgpu` is too heavy for
-  this simple project, direct WebGL calls through `web-sys` are acceptable;
-  look for a suitable minimal wrapper such as `glow` before writing one.
+- Render with OpenGL through `glow`. `wgpu` was judged too heavy for this
+  simple project.
 
 ## Output and workflow
 
-- Produce a browser-runnable `.wasm` file using wasm-pack or wasm-bindgen.
-- Keep the HTML loader minimal and hand-written. It must contain no
-  agent-authored JavaScript; invoking the generated wasm-bindgen loader is the
-  required exception.
+- Produce one native executable with `cargo build --release`; package Linux
+  as a `.deb` with cargo-deb and cross-compile Windows with cargo-xwin. Keep
+  the packages as small as practical.
 - For the original first deliverable, the required files were Cargo and
   wasm-pack configuration, the HTML loader, and Rust code for camera
   position/yaw/pitch, WASD and mouse look, ground and 3–5 boxes, a bottom-center
@@ -82,8 +78,7 @@ unless the owner explicitly changes them.
 - Work in this order for new implementation needs: research suitable
   open-source crates/snippets and check their quality; present a simple file
   plan; implement in Rust with source comments for borrowed parts; compile
-  with a command such as `wasm-pack build --target web`; run on localhost and
-  verify in the browser; report briefly what worked, what did not, and a
+  with `cargo build --release`; run the game and verify it; report briefly what worked, what did not, and a
   reasonable next step.
 - The owner required the original research findings before coding and then
   approved that first implementation. Do not repeat that approval request for

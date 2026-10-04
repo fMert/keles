@@ -1,21 +1,38 @@
 [package]
 name = "keles"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-
-[lib]
-crate-type = ["cdylib"]
+description = "Keles multiplayer FPS"
+repository = "https://github.com/fMert/keles"
 
 [dependencies]
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "wayland", "x11"] }
+ewebsock = { version = "0.8.0", features = ["tls"] }
 glam = "0.33.12"
-js-sys = "0.3.106"
-wasm-bindgen = "0.2.129"
-web-sys = { version = "0.3.106", features = [
-    "CssStyleDeclaration", "Document", "Element", "Event", "EventTarget", "HtmlButtonElement",
-    "HtmlCanvasElement", "HtmlElement", "HtmlImageElement", "HtmlInputElement", "Node",
-    "KeyboardEvent", "Location", "MessageEvent", "MouseEvent", "WebSocket",
-    "WebGl2RenderingContext", "WebGlBuffer",
-    "WebGlProgram", "WebGlShader", "WebGlTexture", "WebGlUniformLocation", "WebGlVertexArrayObject",
-    "Window",
-] }
+image = { version = "0.25.6", default-features = false, features = ["png"] }
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+opt-level = "s"
+
+[package.metadata.deb]
+# Keeps the 0.2 package name so apt upgrades it in place.
+name = "keles-desktop"
+maintainer = "fMert <fmert@users.noreply.github.com>"
+copyright = "Keles contributors"
+license-file = ["LICENSE", "0"]
+# Windowing and OpenGL libraries are loaded at runtime, so list them by hand.
+depends = "$auto, fonts-dejavu-core, libgl1, libegl1, libx11-6, libx11-xcb1, libxcursor1, libxi6, libxrandr2, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1"
+section = "games"
+assets = [
+    ["target/release/keles", "usr/bin/keles", "755"],
+    ["keles.desktop", "usr/share/applications/keles.desktop", "644"],
+    ["README.md", "usr/share/doc/keles-desktop/README.md", "644"],
+    ["THIRD-PARTY-LICENSES.txt", "usr/share/doc/keles-desktop/THIRD-PARTY-LICENSES.txt", "644"],
+    ["LICENSE-MIT-WebGL2Samples", "usr/share/doc/keles-desktop/LICENSE-MIT-WebGL2Samples", "644"],
+    ["LICENSE-MIT-wasm-bindgen", "usr/share/doc/keles-desktop/LICENSE-MIT-wasm-bindgen", "644"],
+    ["LICENSE-MIT-egui", "usr/share/doc/keles-desktop/LICENSE-MIT-egui", "644"],
+]
