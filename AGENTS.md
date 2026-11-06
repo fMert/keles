@@ -6,10 +6,9 @@ unless the owner explicitly changes them.
 
 ## Goal and initial scope
 
-- Build an extremely lightweight, extremely simple FPS foundation. It began
-  as a browser game; in release 0.3.0 the owner dropped the web version. The
-  game is now a native desktop program (Linux and Windows) with no browser
-  engine, web view or WASM.
+- Build an extremely lightweight, extremely simple browser-only FPS using
+  Rust, WebAssembly and WebGL2. The owner replaced the desktop-only scope;
+  the Rust game server remains a separate native program.
 - The initial scene is three-dimensional: one ground plane and a few simple
   colored, low-poly boxes or obstacles.
 - The player moves with WASD and looks around with the mouse.
@@ -21,8 +20,9 @@ unless the owner explicitly changes them.
 
 ## Non-negotiable implementation constraints
 
-1. Do not author JavaScript, directly or indirectly. Do not render through
-   Chromium, WebKit or any other browser engine; the owner rejected both.
+1. Do not author JavaScript game code. JavaScript loading/binding code generated
+   by the WebAssembly build tools is allowed. Render locally in the player's
+   desktop browser through WebGL2; do not stream server-rendered video.
 2. All implementation code authored by an agent must be pure Rust. Borrowed
    source may originate in C, C++, Zig, Odin, or another language if it can be
    compiled, linked, ported cleanly, or used as a reference; any code
@@ -59,8 +59,8 @@ unless the owner explicitly changes them.
 
 ## Prefer existing tools and libraries
 
-- Use eframe (winit + glutin) for the window, input and OpenGL context, and
-  egui for menus and the HUD; do not write windowing or UI toolkits.
+- Use eframe's web runner, egui for menus and the HUD, and ewebsock for networking;
+  do not replace the existing engine or write windowing or UI toolkits.
 - Use a mature math crate such as `glam` or `nalgebra`; do not write a matrix
   library.
 - Render with OpenGL through `glow`. `wgpu` was judged too heavy for this
@@ -68,17 +68,20 @@ unless the owner explicitly changes them.
 
 ## Output and workflow
 
-- Produce one native executable with `cargo build --release`; package Linux
-  as a `.deb` with cargo-deb and cross-compile Windows with cargo-xwin. Keep
-  the packages as small as practical.
+- Produce the release web client with `trunk build --release --locked` in
+  `dist/web/`. Build server changes with
+  `cargo build --release --locked --manifest-path server/Cargo.toml`.
+  Do not produce desktop graphical clients or `.exe`/`.deb` packages.
+  Work locally only: no VPS, SSH, remote commands, uploads, deployment, or
+  domain/DNS/TLS/proxy/service administration. Local development servers are allowed.
 - For the original first deliverable, the required files were Cargo and
   wasm-pack configuration, the HTML loader, and Rust code for camera
   position/yaw/pitch, WASD and mouse look, ground and 3–5 boxes, a bottom-center
   2D weapon placeholder, and the render loop.
 - Work in this order for new implementation needs: research suitable
   open-source crates/snippets and check their quality; present a simple file
-  plan; implement in Rust with source comments for borrowed parts; compile
-  with `cargo build --release`; run the game and verify it; report briefly what worked, what did not, and a
+  plan; implement in Rust with source comments for borrowed parts; compile the web
+  release and changed server; run the game locally and verify it; report briefly what worked, what did not, and a
   reasonable next step.
 - The owner required the original research findings before coding and then
   approved that first implementation. Do not repeat that approval request for

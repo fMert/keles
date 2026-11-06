@@ -1,4 +1,4 @@
-#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -16,6 +16,68 @@ use glam::{camera, Mat4, Vec3};
 #[allow(dead_code)]
 mod map;
 use map::Map;
+#[cfg(target_arch = "wasm32")]
+mod web;
+
+fn websocket_url(
+    protocol: &str,
+    host: &str,
+    path: &str,
+    development: bool,
+) -> Result<String, &'static str> {
+    if !path.starts_with('/')
+        || path.starts_with("//")
+        || path.contains(['?', '#'])
+        || path.chars().any(|c| c.is_whitespace() || c == '\\')
+    {
+        return Err("WebSocket yolu geçersiz.");
+    }
+    let scheme = match protocol {
+        "https:" => "wss",
+        "http:" => "ws",
+        _ => return Err("Oyun HTTP veya HTTPS üzerinden açılmalı."),
+    };
+    let hostname = host.rsplit_once(':').map_or(host, |(name, _)| name);
+    if development && protocol == "http:" && matches!(hostname, "localhost" | "127.0.0.1" | "[::1]")
+    {
+        return Ok(format!("ws://{hostname}:9001{path}"));
+    }
+    Ok(format!("{scheme}://{host}{path}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::websocket_url;
+
+    #[test]
+    fn websocket_address_keeps_production_on_the_page_origin() {
+        assert_eq!(
+            websocket_url("https:", "example.org", "/keles", false).unwrap(),
+            "wss://example.org/keles"
+        );
+        assert_eq!(
+            websocket_url("http:", "localhost:8080", "/socket", false).unwrap(),
+            "ws://localhost:8080/socket"
+        );
+        assert_eq!(
+            websocket_url("http:", "localhost:8080", "/keles", true).unwrap(),
+            "ws://localhost:9001/keles"
+        );
+        assert_eq!(
+            websocket_url("https:", "example.org:8443", "/socket", true).unwrap(),
+            "wss://example.org:8443/socket"
+        );
+        for path in [
+            "//other.org",
+            "ws://other.org",
+            "/bad path",
+            "/x#fragment",
+            "/\\other",
+        ] {
+            assert!(websocket_url("https:", "example.org", path, false).is_err());
+        }
+    }
+}
 
 // GLSL lines from WebGLSamples/WebGL2Samples/samples/transform_feedback_interleaved.html,
 // lines 20-33 and 52-84; the vertex shader combines its MVP and color snippets.
@@ -168,15 +230,11 @@ const INDICES: [u16; 36] = [
 #[derive(Clone, Copy, PartialEq)]
 enum Screen {
     Main,
-    Modes,
-    MapSelect,
-    Join,
-    Team,
+    Connecting,
     Playing,
     Paused,
     Dead,
     Result,
-    SettingsMain,
     SettingsPaused,
 }
 
@@ -187,13 +245,6 @@ enum Team {
 }
 
 impl Team {
-    fn as_str(self) -> &'static str {
-        match self {
-            Team::Boys => "boys",
-            Team::Girls => "girls",
-        }
-    }
-
     fn color(self) -> Color32 {
         match self {
             Team::Boys => Color32::from_rgb(0x4a, 0x90, 0xff),
@@ -287,7 +338,6 @@ struct Game {
     last_frame: f64,
     screen: Screen,
     map: Map,
-    server: String,
     nickname: String,
     status: String,
     sensitivity: f32,
@@ -313,13 +363,15 @@ struct Game {
     blood: Vec<BloodEffect>,
     local_hit_at: f64,
     grabbed: bool,
-    next_frame: Option<std::time::Instant>,
+    mouse_delta: Vec2,
+    connect_deadline: f64,
 }
 
 impl Game {
     fn new(cc: &eframe::CreationContext) -> Self {
         let gl = cc.gl.clone().expect("Keles needs OpenGL");
         let ctx = &cc.egui_ctx;
+        ctx.set_theme(egui::Theme::Dark);
         let mut visuals = egui::Visuals::dark();
         visuals.override_text_color = Some(TEXT);
         visuals.extreme_bg_color = Color32::from_rgb(0x16, 0x08, 0x06);
@@ -344,21 +396,17 @@ impl Game {
             widget.corner_radius = 0.into();
         }
         ctx.set_visuals(visuals);
-        // A system font keeps font licenses out of the GPL binary.
-        let font = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "C:\\Windows\\Fonts\\segoeui.ttf",
-        ]
-        .iter()
-        .find_map(|path| std::fs::read(path).ok())
-        .expect("No system font (DejaVu Sans or Segoe UI) found");
+        // The previous desktop font, now embedded; Bitstream Vera license, DejaVu changes public domain.
+        // https://github.com/dejavu-fonts/dejavu-fonts (binary asset; see assets/DejaVu-LICENSE.txt).
         let mut fonts = egui::FontDefinitions::empty();
         fonts.font_data.insert(
-            "system".to_owned(),
-            Arc::new(egui::FontData::from_owned(font)),
+            "dejavu".to_owned(),
+            Arc::new(egui::FontData::from_static(include_bytes!(
+                "../assets/DejaVuSans.ttf"
+            ))),
         );
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts.families.insert(family, vec!["system".to_owned()]);
+            fonts.families.insert(family, vec!["dejavu".to_owned()]);
         }
         ctx.set_fonts(fonts);
         let ([width, height], logo) = decode(include_bytes!("../assets/logo.png"));
@@ -444,8 +492,7 @@ impl Game {
                 vertical: 0.0,
                 last_frame: 0.0,
                 screen: Screen::Main,
-                map: Map::Test,
-                server: "127.0.0.1:9001".to_owned(),
+                map: Map::Camel,
                 nickname: String::new(),
                 status: String::new(),
                 sensitivity: 50.0,
@@ -471,7 +518,8 @@ impl Game {
                 blood: Vec::new(),
                 local_hit_at: f64::NEG_INFINITY,
                 grabbed: false,
-                next_frame: None,
+                mouse_delta: Vec2::ZERO,
+                connect_deadline: 0.0,
             }
         }
     }
@@ -498,12 +546,13 @@ impl Game {
         self.screen = screen;
         self.keys = [false; 4];
         self.jump = false;
+        self.mouse_delta = Vec2::ZERO;
+        #[cfg(target_arch = "wasm32")]
+        if !matches!(screen, Screen::Playing | Screen::Connecting) {
+            web::document().exit_pointer_lock();
+        }
         match screen {
             Screen::Playing | Screen::Main => self.status.clear(),
-            Screen::Modes | Screen::MapSelect => self.status = "Press Escape to go back".to_owned(),
-            Screen::Team => {
-                self.status = "Pick a side. Boys and girls see different models.".to_owned()
-            }
             Screen::Dead => self.status = "Waiting to respawn.".to_owned(),
             _ => {}
         }
@@ -511,11 +560,7 @@ impl Game {
 
     fn labels(&self) -> (&'static str, [&'static str; 3]) {
         match self.screen {
-            Screen::Main => ("", ["Play", "Settings", "Coming soon (Ranked)"]),
-            Screen::Modes => ("Choose mode", ["Multiplayer", "Single player", ""]),
-            Screen::MapSelect => ("Choose map", ["Camel", "Test", "Back"]),
-            Screen::Join => ("Multiplayer", ["Connect", "Back", ""]),
-            Screen::Team => ("Choose your team", ["Boys", "Girls", ""]),
+            Screen::Main | Screen::Connecting => ("", ["Oyuna gir", "", ""]),
             Screen::Paused => ("Paused", ["Resume", "Settings", "Main menu"]),
             Screen::Dead => ("You died", ["Respawn", "", ""]),
             Screen::Result => (
@@ -525,66 +570,37 @@ impl Game {
                 },
                 ["", "", ""],
             ),
-            Screen::SettingsMain | Screen::SettingsPaused => ("Settings", ["Back", "", ""]),
+            Screen::SettingsPaused => ("Settings", ["Back", "", ""]),
             Screen::Playing => ("", ["", "", ""]),
         }
     }
 
     fn button(&mut self, index: usize) {
         match (self.screen, index) {
-            (Screen::Join, 0) => match self.server_url() {
-                Ok(_) => self.show_screen(Screen::Team),
-                Err(error) => self.status = error,
-            },
-            (Screen::Team, 0 | 1) => {
-                let team = if index == 0 { Team::Boys } else { Team::Girls };
-                if let Err(error) = self.connect(team) {
+            (Screen::Main, 0) => {
+                if let Err(error) = self.connect() {
                     self.status = error;
-                    self.show_screen(Screen::Join);
                 }
             }
             (Screen::Dead, 0) => {
+                #[cfg(target_arch = "wasm32")]
+                web::canvas().request_pointer_lock();
                 self.send("RESPAWN".to_owned());
-                self.show_screen(Screen::Playing);
             }
             _ => {
                 let next = match (self.screen, index) {
-                    (Screen::Main, 0) => Screen::Modes,
-                    (Screen::Main, 1) => Screen::SettingsMain,
-                    (Screen::Modes, 0) => {
-                        self.status.clear();
-                        Screen::Join
-                    }
-                    (Screen::Modes, 1) => Screen::MapSelect,
-                    (Screen::MapSelect, 0 | 1) => {
-                        self.disconnect();
-                        self.map = if index == 0 { Map::Camel } else { Map::Test };
-                        self.position = if index == 0 {
-                            Vec3::new(
-                                map::CAMEL_SPAWN[0],
-                                map::CAMEL_SPAWN[1] + 1.7,
-                                map::CAMEL_SPAWN[2],
-                            )
-                        } else {
-                            Vec3::new(0.0, 1.7, 5.0)
-                        };
-                        self.yaw = -std::f32::consts::FRAC_PI_2;
-                        self.pitch = 0.0;
-                        self.vertical = 0.0;
-                        self.shot_at = f64::NEG_INFINITY;
-                        self.health = 3;
+                    (Screen::Paused, 0) if self.winner.is_some() => Screen::Result,
+                    (Screen::Paused, 0) if self.health == 0 => Screen::Dead,
+                    (Screen::Paused, 0) => {
+                        #[cfg(target_arch = "wasm32")]
+                        web::canvas().request_pointer_lock();
                         Screen::Playing
                     }
-                    (Screen::MapSelect, 2) => Screen::Modes,
-                    (Screen::Join, 1) => Screen::Modes,
-                    (Screen::Paused, 0) if self.health == 0 => Screen::Dead,
-                    (Screen::Paused, 0) => Screen::Playing,
                     (Screen::Paused, 1) => Screen::SettingsPaused,
                     (Screen::Paused, 2) => {
                         self.disconnect();
                         Screen::Main
                     }
-                    (Screen::SettingsMain, 0) => Screen::Main,
                     (Screen::SettingsPaused, 0) => Screen::Paused,
                     _ => return,
                 };
@@ -598,34 +614,22 @@ impl Game {
             Screen::Playing | Screen::Dead | Screen::Result => {
                 self.show_screen(Screen::Paused);
             }
-            Screen::Modes | Screen::Join => self.show_screen(if self.screen == Screen::Modes {
-                Screen::Main
-            } else {
-                Screen::Modes
-            }),
-            Screen::MapSelect => self.show_screen(Screen::Modes),
-            Screen::Team => {
+            Screen::Connecting => {
                 self.disconnect();
-                self.show_screen(Screen::Join);
+                self.show_screen(Screen::Main);
             }
-            Screen::SettingsMain => self.show_screen(Screen::Main),
             Screen::SettingsPaused => self.show_screen(Screen::Paused),
             _ => {}
         }
     }
 
     fn input(&mut self, ctx: &egui::Context) {
-        let (escape, jump, fire, keys, delta, focused) = ctx.input(|i| {
-            let delta = i.events.iter().fold(Vec2::ZERO, |sum, event| match event {
-                egui::Event::MouseMoved(delta) => sum + *delta,
-                _ => sum,
-            });
+        let (escape, jump, fire, keys, focused) = ctx.input(|i| {
             (
                 i.key_pressed(Key::Escape),
                 i.key_pressed(Key::Space),
                 i.pointer.button_pressed(egui::PointerButton::Primary),
                 [Key::W, Key::A, Key::S, Key::D].map(|key| i.key_down(key)),
-                delta,
                 i.focused,
             )
         });
@@ -635,6 +639,12 @@ impl Game {
         if self.screen != Screen::Playing {
             return;
         }
+        if !self.grabbed {
+            self.keys = [false; 4];
+            self.jump = false;
+            return;
+        }
+        let delta = std::mem::take(&mut self.mouse_delta);
         self.keys = keys;
         self.jump = jump;
         let radians = minecraft_radians_per_count(self.sensitivity);
@@ -653,7 +663,6 @@ impl Game {
     }
 
     fn server_url(&self) -> Result<String, String> {
-        let address = self.server.trim().to_owned();
         let name = self.nickname.trim();
         if name.is_empty()
             || name.len() > 16
@@ -661,28 +670,18 @@ impl Game {
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
         {
-            return Err("Use 1–16 letters, numbers, _ or - for the nickname.".to_owned());
+            return Err("Kullanıcı adı 1–16 harf, rakam, _ veya - içermeli.".to_owned());
         }
-        if address.is_empty() || address.chars().any(char::is_whitespace) {
-            return Err("Enter a server address such as 127.0.0.1:9001.".to_owned());
-        }
-        Ok(
-            if address.starts_with("ws://") || address.starts_with("wss://") {
-                address
-            } else {
-                format!("ws://{address}")
-            },
-        )
+        #[cfg(target_arch = "wasm32")]
+        return web::server_url();
+        #[cfg(not(target_arch = "wasm32"))]
+        Err("The game client requires a browser.".to_owned())
     }
 
-    fn connect(&mut self, team: Team) -> Result<(), String> {
+    fn connect(&mut self) -> Result<(), String> {
         let url = self.server_url()?;
-        let options = ewebsock::Options {
-            // Lower than the default 10 ms so 32 Hz updates are sent promptly.
-            read_timeout: Some(std::time::Duration::from_millis(1)),
-            ..Default::default()
-        };
-        let socket = ewebsock::connect(url, options).map_err(|_| "Invalid server address.")?;
+        let socket = ewebsock::connect(url, Default::default())
+            .map_err(|_| "Bağlantı kurulamadı. Yeniden deneyin.")?;
         self.disconnect();
         self.map = Map::Camel;
         self.yaw = -std::f32::consts::FRAC_PI_2;
@@ -690,8 +689,12 @@ impl Game {
         self.vertical = 0.0;
         self.socket = Some(socket);
         self.last_sent = 0.0;
-        self.team = Some(team);
-        self.show_screen(Screen::Playing);
+        self.shot_at = f64::NEG_INFINITY;
+        self.connect_deadline = self.last_frame + 10_000.0;
+        self.show_screen(Screen::Connecting);
+        self.status = "Bağlanılıyor…".to_owned();
+        #[cfg(target_arch = "wasm32")]
+        web::canvas().request_pointer_lock();
         Ok(())
     }
 
@@ -703,17 +706,15 @@ impl Game {
         {
             match event {
                 WsEvent::Opened => {
-                    if let Some(team) = self.team {
-                        let name = self.nickname.trim().to_owned();
-                        self.send(format!("JOIN|{name}|{}", team.as_str()));
-                    }
+                    let name = self.nickname.trim().to_owned();
+                    self.send(format!("JOIN|{name}"));
                 }
                 WsEvent::Message(WsMessage::Text(text)) => self.message(&text),
                 WsEvent::Message(_) => {}
                 WsEvent::Error(_) | WsEvent::Closed => {
                     self.disconnect();
-                    self.status = "Connection closed. Check the server address.".to_owned();
-                    self.show_screen(Screen::Join);
+                    self.show_screen(Screen::Main);
+                    self.status = "Bağlantı kapandı. Yeniden deneyin.".to_owned();
                 }
             }
         }
@@ -723,7 +724,8 @@ impl Game {
         let mut parts = text.split('|');
         match parts.next() {
             Some("WELCOME") => {
-                if let (Some(id), Some(x), Some(z), Some(y), Some(health)) = (
+                if let (Some(id), Some(x), Some(z), Some(y), Some(health), Some(team)) = (
+                    parts.next(),
                     parts.next(),
                     parts.next(),
                     parts.next(),
@@ -738,10 +740,21 @@ impl Game {
                         health.parse::<u8>(),
                     ) {
                         self.position = Vec3::new(x, y + map::EYE_HEIGHT, z);
+                        self.ground = self.position;
                         self.vertical = 0.0;
                         self.self_id = Some(id);
                         self.health = health;
                         self.connected = true;
+                        self.team = Some(if team == "girls" {
+                            Team::Girls
+                        } else {
+                            Team::Boys
+                        });
+                        self.show_screen(if self.grabbed {
+                            Screen::Playing
+                        } else {
+                            Screen::Paused
+                        });
                     }
                 }
             }
@@ -774,6 +787,7 @@ impl Game {
                         (x.parse::<f32>(), y.parse::<f32>(), z.parse::<f32>())
                     {
                         self.position = Vec3::new(x, y + map::EYE_HEIGHT, z);
+                        self.ground = self.position;
                         self.vertical = 0.0;
                         self.shot_at = f64::NEG_INFINITY;
                         // AT also starts a new round, so a past win must not block
@@ -781,7 +795,11 @@ impl Game {
                         self.winner = None;
                         // Leave an open pause or settings menu alone.
                         if !matches!(self.screen, Screen::Paused | Screen::SettingsPaused) {
-                            self.show_screen(Screen::Playing);
+                            self.show_screen(if self.grabbed {
+                                Screen::Playing
+                            } else {
+                                Screen::Paused
+                            });
                         }
                     }
                 }
@@ -922,8 +940,19 @@ impl Game {
                     .unwrap_or("Server rejected connection")
                     .to_owned();
                 self.disconnect();
-                self.status = reason;
-                self.show_screen(Screen::Join);
+                self.show_screen(Screen::Main);
+                self.status = match reason.as_str() {
+                    "Nickname already in use" => {
+                        "Bu kullanıcı adı kullanımda. Başka bir ad deneyin."
+                    }
+                    "Server is full" => "Sunucu dolu. Biraz sonra yeniden deneyin.",
+                    "Invalid nickname" => "Kullanıcı adı 1–16 harf, rakam, _ veya - içermeli.",
+                    "Too many players from your address" => {
+                        "Bu bağlantıdan oyuncu sınırına ulaşıldı."
+                    }
+                    _ => "Bağlantı reddedildi. Yeniden deneyin.",
+                }
+                .to_owned();
             }
             _ => {}
         }
@@ -939,10 +968,7 @@ impl Game {
             let eased = Vec3::new(player.x, player.y, player.z).lerp(player.target, blend);
             (player.x, player.y, player.z) = (eased.x, eased.y, eased.z);
         }
-        if matches!(
-            self.screen,
-            Screen::Main | Screen::Modes | Screen::MapSelect | Screen::Join | Screen::SettingsMain
-        ) {
+        if matches!(self.screen, Screen::Main | Screen::Connecting) {
             return false;
         }
         let forward = Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin());
@@ -1304,7 +1330,7 @@ impl Game {
                         self.blood.clear();
                         self.local_hit_at = f64::NEG_INFINITY;
                     }
-                    let mut display = ui.checkbox(&mut self.fullscreen, "Fullscreen").changed();
+                    let display = ui.checkbox(&mut self.fullscreen, "Fullscreen").changed();
                     let monitor = ui.ctx().input(|i| i.viewport().monitor_size).map(|size| {
                         size * ui
                             .ctx()
@@ -1330,13 +1356,12 @@ impl Game {
                                     })
                                     .map(Some),
                             ) {
-                                display |= ui
-                                    .selectable_value(
-                                        &mut self.resolution,
-                                        resolution,
-                                        name(resolution),
-                                    )
-                                    .changed();
+                                ui.selectable_value(
+                                    &mut self.resolution,
+                                    resolution,
+                                    name(resolution),
+                                )
+                                .changed();
                             }
                         });
                     let limit = |fps: u32| match fps {
@@ -1353,19 +1378,20 @@ impl Game {
                             }
                         });
                     if display {
-                        self.apply_display(ui.ctx());
+                        self.apply_display();
                     }
                 })
             });
     }
 
-    fn apply_display(&self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
-        if let (false, Some([width, height])) = (self.fullscreen, self.resolution) {
-            let size = vec2(width as f32, height as f32);
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
-                size / ctx.input(|i| i.viewport().native_pixels_per_point.unwrap_or(1.0)),
-            ));
+    fn apply_display(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        if self.fullscreen {
+            if web::canvas().request_fullscreen().is_err() {
+                self.status = "Tam ekran açılamadı. Tarayıcı izinlerini kontrol edin.".to_owned();
+            }
+        } else {
+            web::document().exit_fullscreen();
         }
     }
 
@@ -1405,14 +1431,16 @@ impl Game {
                     * (screen.width() * 0.92 / size.x)
                         .min(screen.height() * 0.58 / size.y)
                         .min(1.0);
-                ui.set_width(if self.screen == Screen::Main {
-                    logo.x.max(520.0)
-                } else {
-                    520.0
-                });
+                ui.set_width(
+                    if matches!(self.screen, Screen::Main | Screen::Connecting) {
+                        logo.x.max(520.0)
+                    } else {
+                        520.0
+                    },
+                );
                 ui.vertical_centered(|ui| {
                     ui.spacing_mut().item_spacing.y = 14.0;
-                    if self.screen == Screen::Main {
+                    if matches!(self.screen, Screen::Main | Screen::Connecting) {
                         ui.image((self.logo.id(), logo));
                     }
                     if !title.is_empty() {
@@ -1423,37 +1451,31 @@ impl Game {
                                 .color(TITLE),
                         );
                     }
-                    if self.screen == Screen::Join {
-                        for (value, hint, limit) in [
-                            (&mut self.server, "Server IP:port or wss:// address", 256),
-                            (&mut self.nickname, "Nickname", 16),
-                        ] {
-                            ui.add(
-                                egui::TextEdit::singleline(value)
-                                    .hint_text(hint)
-                                    .char_limit(limit)
-                                    .font(FontId::proportional(18.0))
-                                    .margin(vec2(18.0, 12.0))
-                                    .desired_width(340.0),
-                            );
-                        }
+                    if matches!(self.screen, Screen::Main | Screen::Connecting) {
+                        ui.add_enabled(
+                            self.screen == Screen::Main,
+                            egui::TextEdit::singleline(&mut self.nickname)
+                                .hint_text("Kullanıcı adı")
+                                .char_limit(16)
+                                .font(FontId::proportional(18.0))
+                                .margin(vec2(18.0, 12.0))
+                                .desired_width(340.0),
+                        );
                     }
-                    if self.screen != Screen::Main && !self.status.is_empty() {
+                    if !self.status.is_empty() {
                         ui.set_max_width(340.0);
                         ui.label(RichText::new(&self.status).size(16.0).color(STATUS));
                     }
-                    if matches!(self.screen, Screen::SettingsMain | Screen::SettingsPaused) {
+                    if self.screen == Screen::SettingsPaused {
                         self.settings(ui);
                     }
                     for (index, label) in labels.into_iter().enumerate() {
                         if label.is_empty() {
                             continue;
                         }
-                        let button = egui::Button::new(
-                            RichText::new(label.to_uppercase()).size(20.0).strong(),
-                        )
-                        .min_size(vec2(340.0, 50.0));
-                        let enabled = !(self.screen == Screen::Main && index == 2);
+                        let button = egui::Button::new(RichText::new(label).size(20.0).strong())
+                            .min_size(vec2(340.0, 50.0));
+                        let enabled = self.screen != Screen::Connecting;
                         if ui.add_enabled(enabled, button).clicked() {
                             clicked = Some(index);
                         }
@@ -1593,34 +1615,15 @@ impl Game {
             );
         }
     }
-
-    // Sleeps until the next frame is due. The driver does not wait for vsync,
-    // so this is the only frame pacing.
-    fn limit_fps(&mut self, frame: &eframe::Frame) {
-        let now = std::time::Instant::now();
-        let Some(next) = self.next_frame else {
-            // Start at the monitor's refresh rate.
-            self.fps_limit = frame
-                .winit_window()
-                .and_then(|window| window.current_monitor())
-                .and_then(|monitor| monitor.refresh_rate_millihertz())
-                .map_or(144, |millihertz| (millihertz + 500) / 1000);
-            self.next_frame = Some(now);
-            return;
-        };
-        let next = if self.fps_limit == 0 {
-            now
-        } else {
-            (next + std::time::Duration::from_secs_f64(1.0 / self.fps_limit as f64)).max(now)
-        };
-        std::thread::sleep(next - now);
-        self.next_frame = Some(next);
-    }
 }
 
 impl eframe::App for Game {
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        self.limit_fps(frame);
+    #[cfg(target_arch = "wasm32")]
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time) * 1000.0;
         if now - self.fps_since >= 500.0 {
@@ -1630,18 +1633,17 @@ impl eframe::App for Game {
         }
         self.fps_frames += 1;
         self.poll_socket();
-        self.input(&ctx);
-        let grab = self.screen == Screen::Playing;
-        if grab != self.grabbed {
-            self.grabbed = grab;
-            // X11 cannot lock the cursor in place, so confine it and read raw motion.
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(if grab {
-                egui::CursorGrab::Confined
-            } else {
-                egui::CursorGrab::None
-            }));
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(!grab));
+        if self.screen == Screen::Connecting && now >= self.connect_deadline {
+            self.disconnect();
+            self.show_screen(Screen::Main);
+            self.status = "Sunucuya ulaşılamadı. Yeniden deneyin.".to_owned();
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.grabbed = web::document().pointer_lock_element().is_some();
+            self.fullscreen = web::document().fullscreen_element().is_some();
+        }
+        self.input(&ctx);
         if self.screen == Screen::Result {
             let remaining = ((self.result_deadline - now) / 1000.0).ceil().max(0.0) as u32;
             self.status = format!("Restarting in {remaining}");
@@ -1650,8 +1652,7 @@ impl eframe::App for Game {
         let screen = ctx.viewport_rect();
         let window = (screen.size() * ctx.pixels_per_point()).round();
         let target = match self.resolution {
-            // A windowed game is resized to the resolution instead.
-            Some(resolution) if self.fullscreen => resolution,
+            Some(resolution) => resolution,
             _ => [window.x.max(1.0) as u32, window.y.max(1.0) as u32],
         };
         if self.draw(now, target) {
@@ -1680,7 +1681,14 @@ impl eframe::App for Game {
         }
         self.menu(&ctx);
         self.hud(&ctx);
-        ctx.request_repaint();
+        // eframe schedules this through requestAnimationFrame; never block the browser.
+        if self.fps_limit == 0 {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                1.0 / self.fps_limit as f64,
+            ));
+        }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -1807,25 +1815,4 @@ unsafe fn link_program(gl: &glow::Context, vertex: &str, fragment: &str) -> glow
         gl.get_program_info_log(program)
     );
     program
-}
-
-// Adapted from emilk/egui, examples/hello_world/src/main.rs, lines 8-21,
-// commit 2ec7a836879b958f05ef542fab5a12a86250ef62.
-// https://github.com/emilk/egui/blob/2ec7a836879b958f05ef542fab5a12a86250ef62/examples/hello_world/src/main.rs#L8
-// License: MIT (see LICENSE-MIT-egui).
-fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Keles")
-            .with_app_id("keles")
-            .with_inner_size([1280.0, 800.0]),
-        // The FPS limit setting paces frames, so the driver must not wait for vsync.
-        glow_options: egui_glow::GlowConfiguration {
-            vsync: false,
-            ..Default::default()
-        },
-        dithering: false,
-        ..Default::default()
-    };
-    eframe::run_native("Keles", options, Box::new(|cc| Ok(Box::new(Game::new(cc)))))
 }

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="keles-websocket-path" content="/keles">
+  <title>Keles</title>
+  <link data-trunk rel="rust" data-wasm-opt="s" data-wasm-opt-params="--enable-bulk-memory --enable-bulk-memory-opt --enable-nontrapping-float-to-int --enable-sign-ext">
+  <link data-trunk rel="copy-file" href="LICENSE">
+  <link data-trunk rel="copy-file" href="THIRD-PARTY-LICENSES.txt">
+  <link data-trunk rel="copy-file" href="assets/DejaVu-LICENSE.txt">
+  <link data-trunk rel="copy-file" href="LICENSE-MIT-WebGL2Samples">
+  <link data-trunk rel="copy-file" href="LICENSE-MIT-wasm-bindgen">
+  <link data-trunk rel="copy-file" href="LICENSE-MIT-egui">
+  <style>
+    html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #140704; color: #ffe6da; font-family: sans-serif; }
+    canvas { display: block; width: 100%; height: 100%; outline: none; }
+    #loading { position: fixed; inset: 0; display: grid; place-content: center; text-align: center; pointer-events: none; }
+    #loading a { color: #ff7a2c; pointer-events: auto; }
+    .load-error { opacity: 0; animation: reveal 0s 20s forwards; }
+    @keyframes reveal { to { opacity: 1; } }
+  </style>
+</head>
+<body>
+  <canvas id="keles" aria-label="Keles oyunu"></canvas>
+  <div id="loading" role="status">Keles yükleniyor…<span class="load-error">Yüklenmediyse <a href="">yeniden deneyin</a>.</span><noscript>Oyun için WebAssembly ve JavaScript etkin olmalı.</noscript></div>
+</body>
+</html>

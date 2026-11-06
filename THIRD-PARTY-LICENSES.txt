@@ -1,3 +1,39 @@
+Keles asset and source credits
+
+Camel: "de_dust2 - CS map" by vrchris, CC BY 4.0.
+https://sketchfab.com/3d-models/de-dust2-cs-map-056008d59eb849a29c0ab6884c0c3d87
+https://creativecommons.org/licenses/by/4.0/
+The supplied original is assets/camel_original.glb; tools/convert extracts its
+mesh and textures. The listing is the uploader's license claim; distributors
+should verify rights to this Counter-Strike-derived asset.
+Character turnarounds, logo and weapon images: supplied by the project owner.
+DejaVu Sans: https://github.com/dejavu-fonts/dejavu-fonts, Bitstream Vera license
+with public-domain DejaVu changes (see DejaVu-LICENSE.txt). A long-established
+font project distributed by Debian and previously used by this game's desktop client.
+
+Existing borrowed code retains exact paths, line ranges and licenses in source:
+- emilk/egui, crates/egui_demo_app/src/apps/custom3d_glow.rs:67-75,
+  commit 2ec7a836879b958f05ef542fab5a12a86250ef62, MIT OR Apache-2.0.
+  https://github.com/emilk/egui
+  Established GUI library with CI, maintained examples and production use in Rerun.
+- wasm-bindgen/wasm-bindgen, examples/webgl/src/lib.rs:89-134, MIT OR Apache-2.0.
+  https://github.com/wasm-bindgen/wasm-bindgen
+  Established Rust/WASM toolchain with tests, CI and widespread downstream use.
+- WebGLSamples/WebGL2Samples, samples/transform_feedback_interleaved.html:20-33,
+  52-84; samples/texture_format.html:20-55, MIT.
+  https://github.com/WebGLSamples/WebGL2Samples
+  Long-standing collection of documented, focused WebGL2 examples.
+- snapview/tungstenite-rs, README.md:5-26, MIT OR Apache-2.0.
+  https://github.com/snapview/tungstenite-rs
+  Established WebSocket implementation with tests, CI and use by ewebsock.
+- aevyrie/bevy_mod_raycast, src/primitives.rs, intersects_aabb:164-203, MIT.
+  https://github.com/aevyrie/bevy_mod_raycast
+  Established Bevy ecosystem project with examples, history and downstream users.
+Server-specific licenses are retained under server/.
+
+Dependency license notices (retained from the desktop distribution; include
+notices for dependencies no longer shipped by the web client):
+
 Apache License 2.0
 ring 0.17.14 — https://github.com/briansmith/ring
 

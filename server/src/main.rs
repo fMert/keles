@@ -16,8 +16,10 @@ use tungstenite::{accept_hdr_with_config, protocol::WebSocketConfig, Error, Mess
 mod map;
 
 const MAX_PLAYERS: usize = 16;
+// Leave a few bounded handshake slots so full matches can return ERROR.
+const MAX_CONNECTIONS: usize = MAX_PLAYERS + 8;
 // ponytail: players behind one NAT share this; raise it if they do. Handshakes
-// that never JOIN are only bounded by MAX_PLAYERS threads and the 5 s timeout.
+// that never JOIN are bounded by MAX_CONNECTIONS threads and the 5 s timeout.
 const MAX_PER_IP: usize = 4;
 const MAX_HEALTH: u8 = 3;
 const ROUND_RESET: Duration = Duration::from_secs(10);
@@ -81,6 +83,14 @@ fn team_spawn(team: &str, rng: &mut Rng) -> (f32, f32, f32) {
         }
     }
     ((area[0] + area[2]) * 0.5, (area[1] + area[3]) * 0.5, floor)
+}
+
+fn choose_team(boys: usize, girls: usize, rng: &mut Rng) -> &'static str {
+    if boys < girls || (boys == girls && rng.next_u64() & 1 == 0) {
+        "boys"
+    } else {
+        "girls"
+    }
 }
 
 // A client whose queue is full has fallen behind; dropping it beats letting it
@@ -187,11 +197,7 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
     let Some(name) = join_fields.next() else {
         return;
     };
-    let team = if join_fields.next() == Some("girls") {
-        "girls"
-    } else {
-        "boys"
-    };
+    // Old clients may still send a team; assignment is always authoritative.
     if name.is_empty()
         || name.len() > 16
         || !name
@@ -210,7 +216,7 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
         ^ (id as u64) << 32;
     let mut rng = Rng::new(seed);
     let (outgoing, incoming) = mpsc::sync_channel::<String>(128);
-    let (existing, x, z, y, score, winner) = {
+    let (existing, x, z, y, team, score, winner) = {
         let mut world = shared.lock().unwrap();
         if world.players.values().any(|player| player.name == name) {
             drop(world);
@@ -235,6 +241,8 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
             ));
             return;
         }
+        let boys = world.players.values().filter(|p| p.team == "boys").count();
+        let team = choose_team(boys, world.players.len() - boys, &mut rng);
         let (x, z, y) = team_spawn(team, &mut rng);
         let existing = world
             .players
@@ -279,13 +287,14 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
             x,
             z,
             y,
+            team,
             (world.boys, world.girls),
             world.winner.map(|w| (w, remaining.unwrap_or(0))),
         )
     };
     let mut ready = socket
         .send(Message::Text(
-            format!("WELCOME|{id}|{x}|{z}|{y}|{MAX_HEALTH}").into(),
+            format!("WELCOME|{id}|{x}|{z}|{y}|{MAX_HEALTH}|{team}").into(),
         ))
         .is_ok();
     if ready {
@@ -550,6 +559,121 @@ mod tests {
     use super::*;
 
     #[test]
+    fn teams_balance_and_ties_can_choose_either_side() {
+        let mut rng = Rng::new(7);
+        assert_eq!(choose_team(1, 2, &mut rng), "boys");
+        assert_eq!(choose_team(2, 1, &mut rng), "girls");
+        let choices: Vec<_> = (0..32).map(|_| choose_team(2, 2, &mut rng)).collect();
+        assert!(choices.contains(&"boys") && choices.contains(&"girls"));
+    }
+
+    #[test]
+    fn websocket_join_movement_damage_and_rejections() {
+        let shared = Arc::new(Mutex::new(World {
+            players: HashMap::new(),
+            boys: 0,
+            girls: 0,
+            winner: None,
+            reset_at: None,
+        }));
+        let ids = Arc::new(AtomicU32::new(1));
+        let connect = || {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let shared = shared.clone();
+            let ids = ids.clone();
+            let handle = thread::spawn(move || {
+                handle_client(listener.accept().unwrap().0, shared, ids);
+            });
+            let stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let (socket, _) = tungstenite::client(format!("ws://{address}/keles"), stream).unwrap();
+            (socket, handle)
+        };
+        let read = |socket: &mut tungstenite::WebSocket<TcpStream>, prefix: &str| -> String {
+            loop {
+                if let Message::Text(text) = socket.read().unwrap() {
+                    if text.starts_with(prefix) {
+                        return text.to_string();
+                    }
+                }
+            }
+        };
+        let (mut first, first_thread) = connect();
+        first.send(Message::Text("JOIN|First".into())).unwrap();
+        let welcome = read(&mut first, "WELCOME|");
+        let first_id: u32 = welcome.split('|').nth(1).unwrap().parse().unwrap();
+        let (mut second, second_thread) = connect();
+        second.send(Message::Text("JOIN|Second".into())).unwrap();
+        let other = read(&mut second, "WELCOME|");
+        let second_id: u32 = other.split('|').nth(1).unwrap().parse().unwrap();
+        assert_ne!(welcome.split('|').last(), other.split('|').last());
+        assert!(read(&mut first, "ADD|").contains("|Second|"));
+        assert!(read(&mut second, "ADD|").contains("|First|"));
+
+        let (mut duplicate, duplicate_thread) = connect();
+        duplicate.send(Message::Text("JOIN|First".into())).unwrap();
+        assert_eq!(
+            read(&mut duplicate, "ERROR|"),
+            "ERROR|Nickname already in use"
+        );
+        duplicate_thread.join().unwrap();
+        let (mut invalid, invalid_thread) = connect();
+        invalid.send(Message::Text("JOIN|bad name".into())).unwrap();
+        assert_eq!(read(&mut invalid, "ERROR|"), "ERROR|Invalid nickname");
+        invalid_thread.join().unwrap();
+
+        // Put the two real connections next to each other on an open spawn terrace.
+        let (x, z, y) = team_spawn("boys", &mut Rng::new(7));
+        assert!(map::ray_map([x, y + 1.7, z], [1.0, 0.0, 0.0]) > 0.8);
+        {
+            let mut world = shared.lock().unwrap();
+            for (id, offset) in [(first_id, 0.0), (second_id, 0.8)] {
+                let player = world.players.get_mut(&id).unwrap();
+                (player.x, player.z, player.y) = (x + offset, z, y);
+            }
+        }
+        first
+            .send(Message::Text(format!("POS|{x}|{z}|{y}|0").into()))
+            .unwrap();
+        assert!(read(&mut second, "MOVE|").starts_with(&format!("MOVE|{first_id}|")));
+        first.send(Message::Text("FIRE|0|0".into())).unwrap();
+        assert_eq!(read(&mut second, "HP|"), format!("HP|{second_id}|2"));
+        first.close(None).unwrap();
+        second.close(None).unwrap();
+        drop((first, second));
+        first_thread.join().unwrap();
+        second_thread.join().unwrap();
+
+        {
+            let mut world = shared.lock().unwrap();
+            let (outgoing, _incoming) = mpsc::sync_channel(1);
+            for id in 1..=MAX_PLAYERS as u32 {
+                world.players.insert(
+                    id,
+                    Player {
+                        name: format!("Player{id}"),
+                        x,
+                        z,
+                        y,
+                        yaw: 0.0,
+                        health: 3,
+                        team: "boys",
+                        ip: IpAddr::from([127, 0, 0, 1]),
+                        outgoing: outgoing.clone(),
+                    },
+                );
+            }
+        }
+        let (mut full, full_thread) = connect();
+        full.send(Message::Text("JOIN|Full".into())).unwrap();
+        assert_eq!(read(&mut full, "ERROR|"), "ERROR|Server is full");
+        full_thread.join().unwrap();
+    }
+
+    #[test]
     fn reset_clears_scores_and_respawns_everyone() {
         let player = |team, outgoing| Player {
             name: String::new(),
@@ -615,7 +739,7 @@ fn main() -> std::io::Result<()> {
         let Ok(stream) = stream else {
             continue;
         };
-        if active.fetch_add(1, Ordering::Relaxed) >= MAX_PLAYERS {
+        if active.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
             active.fetch_sub(1, Ordering::Relaxed);
             continue;
         }
