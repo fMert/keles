@@ -196,12 +196,7 @@ void main()
 }
 "#;
 
-// Menu and HUD colors after the logo: charred black panels and a
-// crimson-to-amber glow.
-const CRIMSON: Color32 = Color32::from_rgb(0xff, 0x4a, 0x1c);
-const TEXT: Color32 = Color32::from_rgb(0xff, 0xe6, 0xda);
-const STATUS: Color32 = Color32::from_rgb(0xf0, 0xa9, 0x8a);
-const TITLE: Color32 = Color32::from_rgb(0xff, 0x7a, 0x2c);
+mod ui;
 
 const VERTICES: [f32; 24] = [
     -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, -1.0, 1.0, -1.0,
@@ -328,8 +323,8 @@ enum Team {
 impl Team {
     fn color(self) -> Color32 {
         match self {
-            Team::Boys => Color32::from_rgb(0x4a, 0x90, 0xff),
-            Team::Girls => Color32::from_rgb(0xff, 0x66, 0xcc),
+            Team::Boys => ui::BOYS,
+            Team::Girls => ui::GIRLS,
         }
     }
 
@@ -388,6 +383,7 @@ fn operative_view(player: &RemotePlayer, viewer: Vec3) -> usize {
 }
 
 struct Game {
+    ctx: egui::Context,
     gl: Arc<glow::Context>,
     program: glow::Program,
     vao: glow::VertexArray,
@@ -419,6 +415,7 @@ struct Game {
     jump: bool,
     vertical: f32,
     last_frame: f64,
+    last_draw: f64,
     screen: Screen,
     map: Map,
     username: String,
@@ -468,6 +465,7 @@ struct Game {
     fps: u32,
     fps_since: f64,
     fps_frames: u32,
+    backdrop_slow: u8,
     health: u8,
     self_id: Option<u32>,
     socket: Option<(ewebsock::WsSender, ewebsock::WsReceiver)>,
@@ -489,31 +487,7 @@ impl Game {
     fn new(cc: &eframe::CreationContext) -> Self {
         let gl = cc.gl.clone().expect("Keles needs OpenGL");
         let ctx = &cc.egui_ctx;
-        ctx.set_theme(egui::Theme::Dark);
-        let mut visuals = egui::Visuals::dark();
-        visuals.override_text_color = Some(TEXT);
-        visuals.extreme_bg_color = Color32::from_rgb(0x16, 0x08, 0x06);
-        visuals.selection.bg_fill = CRIMSON;
-        for (widget, fill) in [
-            (
-                &mut visuals.widgets.inactive,
-                Color32::from_rgb(0x24, 0x0b, 0x07),
-            ),
-            (
-                &mut visuals.widgets.hovered,
-                Color32::from_rgb(0xa3, 0x26, 0x0c),
-            ),
-            (
-                &mut visuals.widgets.active,
-                Color32::from_rgb(0x3d, 0x0d, 0x05),
-            ),
-        ] {
-            widget.bg_fill = fill;
-            widget.weak_bg_fill = fill;
-            widget.bg_stroke = Stroke::new(1.0, CRIMSON);
-            widget.corner_radius = 0.into();
-        }
-        ctx.set_visuals(visuals);
+        ui::apply_theme(ctx);
         // The previous desktop font, now embedded; Bitstream Vera license, DejaVu changes public domain.
         // https://github.com/dejavu-fonts/dejavu-fonts (binary asset; see assets/DejaVu-LICENSE.txt).
         let mut fonts = egui::FontDefinitions::empty();
@@ -572,6 +546,7 @@ impl Game {
                 vertex_array(&gl, &floats(&SPRITE_VERTICES), 16, &[(0, 2, 0), (4, 2, 8)]);
             let weapon = |png| texture(&gl, png, glow::CLAMP_TO_EDGE);
             Game {
+                ctx: ctx.clone(),
                 transform: gl.get_uniform_location(program, "MVP").unwrap(),
                 texture_enabled: gl.get_uniform_location(program, "use_texture").unwrap(),
                 sprite_transform: gl.get_uniform_location(sprite_program, "MVP").unwrap(),
@@ -609,6 +584,7 @@ impl Game {
                 jump: false,
                 vertical: 0.0,
                 last_frame: 0.0,
+                last_draw: 0.0,
                 screen: Screen::Auth,
                 map: Map::Camel,
                 username: web::storage_get("keles.username").unwrap_or_default(),
@@ -654,10 +630,11 @@ impl Game {
                 show_blood: true,
                 fullscreen: false,
                 resolution: None,
-                fps_limit: 0,
+                fps_limit: 60,
                 fps: 0,
                 fps_since: 0.0,
                 fps_frames: 0,
+                backdrop_slow: 0,
                 health: 3,
                 self_id: None,
                 socket: None,
@@ -708,6 +685,7 @@ impl Game {
         self.mouse_delta = Vec2::ZERO;
         #[cfg(target_arch = "wasm32")]
         if !matches!(screen, Screen::Playing | Screen::MatchIntro)
+            && !(screen == Screen::Dead && self.mode == Mode::Ranked)
             && !(screen == Screen::Boot && self.grabbed)
         {
             web::document().exit_pointer_lock();
@@ -798,7 +776,9 @@ impl Game {
                     return;
                 }
                 self.lock_pointer();
-                self.show_screen(if self.winner.is_some() {
+                self.show_screen(if self.mode == Mode::Ranked && !self.ranked_started {
+                    Screen::MatchIntro
+                } else if self.winner.is_some() {
                     Screen::Result
                 } else if self.health == 0 {
                     Screen::Dead
@@ -860,8 +840,9 @@ impl Game {
         self.disconnect();
         self.account = None;
         self.auth_request = auth;
+        let ctx = self.ctx.clone();
         self.socket = Some(
-            ewebsock::connect(url, Default::default())
+            ewebsock::connect_with_wakeup(url, Default::default(), move || ctx.request_repaint())
                 .map_err(|_| "Bağlantı kurulamadı. Yeniden deneyin.")?,
         );
         self.connect_deadline = self.last_frame + 10_000.0;
@@ -1373,16 +1354,34 @@ impl Game {
     // Moves the player and renders the scene into the off-screen target.
     // Returns false on menus that show no scene.
     fn draw(&mut self, now: f64, [width, height]: [u32; 2]) -> bool {
-        let dt = ((now - self.last_frame) / 1000.0).clamp(0.0, 0.05) as f32;
+        let dt = ((now - self.last_draw) / 1000.0).clamp(0.0, 0.05) as f32;
         self.last_frame = now;
         let blend = (dt * 15.0).min(1.0);
         for player in self.remote.values_mut() {
             let eased = Vec3::new(player.x, player.y, player.z).lerp(player.target, blend);
             (player.x, player.y, player.z) = (eased.x, eased.y, eased.z);
         }
-        if matches!(self.screen, Screen::Auth | Screen::Boot) {
+        let backdrop = matches!(
+            self.screen,
+            Screen::Boot
+                | Screen::Auth
+                | Screen::Lobby
+                | Screen::Queue
+                | Screen::Disconnected
+                | Screen::RankedResult
+        ) || (self.screen == Screen::Settings
+            && self.settings_back == Screen::Lobby);
+        if backdrop && self.backdrop_slow >= 3 {
             return false;
         }
+        if self.target == [width, height]
+            && self.fps_limit > 0
+            && now - self.last_draw < 1000.0 / self.fps_limit as f64
+        {
+            return true;
+        }
+        self.last_draw = now;
+        self.fps_frames += 1;
         let forward = Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin());
         let right = Vec3::new(-forward.z, 0.0, forward.x);
         let movement = forward * (self.keys[0] as i32 - self.keys[2] as i32) as f32
@@ -1476,7 +1475,14 @@ impl Game {
             0.1,
             100.0,
         );
-        let view = camera::rh::view::look_to_mat4(self.position, direction, Vec3::Y);
+        let view = if backdrop {
+            let angle = now as f32 * 0.00005;
+            let center = Vec3::new(0.0, 0.0, 0.0);
+            let eye = center + Vec3::new(angle.cos() * 35.0, 18.0, angle.sin() * 35.0);
+            camera::rh::view::look_to_mat4(eye, (center - eye).normalize(), Vec3::Y)
+        } else {
+            camera::rh::view::look_to_mat4(self.position, direction, Vec3::Y)
+        };
         let vp = projection * view;
 
         let gl = &self.gl;
@@ -1673,129 +1679,42 @@ impl Game {
                 }
                 gl.disable(glow::BLEND);
             }
-            let frame = if now - self.shot_at < 120.0 {
-                1
-            } else if now - self.shot_at < 240.0 {
-                2
-            } else {
-                0
-            };
-            let (aspect, sight_x) = match frame {
-                0 => (1.5, 768.0 / 1536.0),
-                1 => (1.0, 630.0 / 1254.0),
-                _ => (1.0, 665.0 / 1254.0),
-            };
-            let sy = [0.65, 0.69, 0.66][frame];
-            let sx = sy * aspect * height as f32 / width as f32;
-            let weapon =
-                Mat4::from_translation(Vec3::new((0.5 - sight_x) * 2.0 * sx, -1.0 + sy, 0.0))
-                    * Mat4::from_scale(Vec3::new(sx, sy, 1.0));
-            gl.enable(glow::BLEND);
-            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
-            gl.use_program(Some(self.sprite_program));
-            gl.bind_vertex_array(Some(self.sprite_vao));
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.textures[frame]));
-            gl.uniform_matrix_4_f32_slice(
-                Some(&self.sprite_transform),
-                false,
-                &weapon.to_cols_array(),
-            );
-            gl.draw_arrays(glow::TRIANGLES, 0, 6);
-            gl.disable(glow::BLEND);
+            if !backdrop {
+                let frame = if now - self.shot_at < 120.0 {
+                    1
+                } else if now - self.shot_at < 240.0 {
+                    2
+                } else {
+                    0
+                };
+                let (aspect, sight_x) = match frame {
+                    0 => (1.5, 768.0 / 1536.0),
+                    1 => (1.0, 630.0 / 1254.0),
+                    _ => (1.0, 665.0 / 1254.0),
+                };
+                let sy = [0.65, 0.69, 0.66][frame];
+                let sx = sy * aspect * height as f32 / width as f32;
+                let weapon =
+                    Mat4::from_translation(Vec3::new((0.5 - sight_x) * 2.0 * sx, -1.0 + sy, 0.0))
+                        * Mat4::from_scale(Vec3::new(sx, sy, 1.0));
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                gl.use_program(Some(self.sprite_program));
+                gl.bind_vertex_array(Some(self.sprite_vao));
+                gl.bind_texture(glow::TEXTURE_2D, Some(self.textures[frame]));
+                gl.uniform_matrix_4_f32_slice(
+                    Some(&self.sprite_transform),
+                    false,
+                    &weapon.to_cols_array(),
+                );
+                gl.draw_arrays(glow::TRIANGLES, 0, 6);
+                gl.disable(glow::BLEND);
+            }
             gl.bind_vertex_array(None);
             gl.use_program(None);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
         true
-    }
-
-    fn settings(&mut self, ui: &mut egui::Ui) {
-        let before = self.settings_values();
-        egui::Frame::new()
-            .fill(Color32::from_rgba_unmultiplied(30, 9, 5, 235))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(0x7a, 0x24, 0x12)))
-            .inner_margin(egui::Margin::symmetric(22, 18))
-            .show(ui, |ui| {
-                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                    ui.set_width(296.0);
-                    ui.spacing_mut().slider_width = 296.0;
-                    ui.style_mut().override_font_id = Some(FontId::proportional(18.0));
-                    ui.label(format!("Hassasiyet: {}%", self.sensitivity));
-                    ui.add(
-                        egui::Slider::new(&mut self.sensitivity, 0.0..=200.0)
-                            .step_by(1.0)
-                            .show_value(false)
-                            .trailing_fill(true),
-                    );
-                    ui.label(format!("Arayüz ölçeği: {}%", self.hud_scale));
-                    ui.add(
-                        egui::Slider::new(&mut self.hud_scale, 50.0..=200.0)
-                            .step_by(10.0)
-                            .show_value(false)
-                            .trailing_fill(true),
-                    );
-                    ui.checkbox(&mut self.show_fps, "FPS göster");
-                    if ui.checkbox(&mut self.show_blood, "Kan efektleri").changed()
-                        && !self.show_blood
-                    {
-                        self.blood.clear();
-                        self.local_hit_at = f64::NEG_INFINITY;
-                    }
-                    let display = ui.checkbox(&mut self.fullscreen, "Tam ekran").changed();
-                    let monitor = ui.ctx().input(|i| i.viewport().monitor_size).map(|size| {
-                        size * ui
-                            .ctx()
-                            .input(|i| i.viewport().native_pixels_per_point.unwrap_or(1.0))
-                    });
-                    let name = |resolution: Option<[u32; 2]>| match resolution {
-                        Some([width, height]) => format!("{width} × {height}"),
-                        None => "Ekrana uyarla".to_owned(),
-                    };
-                    ui.label("Çözünürlük");
-                    egui::ComboBox::from_id_salt("resolution")
-                        .selected_text(name(self.resolution))
-                        .width(296.0)
-                        .show_ui(ui, |ui| {
-                            for resolution in std::iter::once(None).chain(
-                                RESOLUTIONS
-                                    .into_iter()
-                                    .filter(|[width, height]| {
-                                        monitor.is_none_or(|monitor| {
-                                            *width as f32 <= monitor.x + 0.5
-                                                && *height as f32 <= monitor.y + 0.5
-                                        })
-                                    })
-                                    .map(Some),
-                            ) {
-                                ui.selectable_value(
-                                    &mut self.resolution,
-                                    resolution,
-                                    name(resolution),
-                                )
-                                .changed();
-                            }
-                        });
-                    let limit = |fps: u32| match fps {
-                        0 => "Sınırsız".to_owned(),
-                        fps => format!("{fps} FPS"),
-                    };
-                    ui.label("FPS sınırı");
-                    egui::ComboBox::from_id_salt("fps-limit")
-                        .selected_text(limit(self.fps_limit))
-                        .width(296.0)
-                        .show_ui(ui, |ui| {
-                            for fps in FPS_LIMITS {
-                                ui.selectable_value(&mut self.fps_limit, fps, limit(fps));
-                            }
-                        });
-                    if display {
-                        self.apply_display();
-                    }
-                })
-            });
-        if before != self.settings_values() {
-            self.save_settings();
-        }
     }
 
     fn apply_display(&mut self) {
@@ -1891,369 +1810,6 @@ impl Game {
             }
         }
     }
-
-    fn menu(&mut self, ctx: &egui::Context) {
-        if self.screen == Screen::Playing {
-            return;
-        }
-        egui::Area::new(Id::new("menu"))
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_black_alpha(230))
-                    .inner_margin(24)
-                    .show(ui, |ui| {
-                        ui.set_width(420.0);
-                        ui.vertical_centered(|ui| {
-                            match self.screen {
-                                Screen::Boot => {
-                                    ui.label("Giriş yapılıyor…");
-                                    if ui.button("Geri").clicked() {
-                                        self.logout();
-                                    }
-                                }
-                                Screen::Auth => {
-                                    ui.horizontal(|ui| {
-                                        ui.selectable_value(
-                                            &mut self.register_tab,
-                                            false,
-                                            "Giriş Yap",
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.register_tab,
-                                            true,
-                                            "Kayıt Ol",
-                                        );
-                                    });
-                                    ui.add_enabled_ui(self.pending.is_none(), |ui| {
-                                        ui.label("Kullanıcı adı");
-                                        ui.text_edit_singleline(&mut self.username);
-                                        ui.label("Şifre");
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut self.password)
-                                                .password(true),
-                                        );
-                                        if self.register_tab {
-                                            ui.label("Şifre tekrar");
-                                            ui.add(
-                                                egui::TextEdit::singleline(&mut self.confirm)
-                                                    .password(true),
-                                            );
-                                        }
-                                        ui.checkbox(&mut self.remember, "Beni hatırla");
-                                        if ui
-                                            .button(if self.register_tab {
-                                                "Kayıt ol"
-                                            } else {
-                                                "Giriş yap"
-                                            })
-                                            .clicked()
-                                            || ui.input(|i| i.key_pressed(Key::Enter))
-                                        {
-                                            self.submit_auth();
-                                        }
-                                    });
-                                    if let Some((_, error)) = &self.field_error {
-                                        ui.label(error);
-                                    }
-                                }
-                                Screen::Lobby => {
-                                    ui.heading(format!("Hoş geldin, {}", self.username));
-                                    ui.label(format!(
-                                        "{} çevrimiçi · {}/16 odada",
-                                        self.online, self.dm_players
-                                    ));
-                                    if ui
-                                        .add_enabled(
-                                            self.pending.is_none(),
-                                            egui::Button::new("Takım Ölüm Maçı · Oyna"),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.mode = Mode::Deathmatch;
-                                        self.clear_match();
-                                        self.lock_pointer();
-                                        self.request("PLAY");
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            self.pending.is_none(),
-                                            egui::Button::new("Dereceli maç bul"),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.request("QUEUE");
-                                    }
-                                    if ui.button("Ayarlar").clicked() {
-                                        self.settings_back = Screen::Lobby;
-                                        self.show_screen(Screen::Settings);
-                                    }
-                                    if ui.button("Çıkış yap").clicked() {
-                                        self.logout();
-                                    }
-                                }
-                                Screen::Queue => {
-                                    ui.heading("Rakip aranıyor…");
-                                    ui.label(format!(
-                                        "{} saniye",
-                                        ((self.last_frame - self.queue_since) / 1000.0) as u32
-                                    ));
-                                    if ui.button("İptal (Esc)").clicked() {
-                                        self.request("UNQUEUE");
-                                    }
-                                }
-                                Screen::MatchIntro => {
-                                    ui.heading(format!(
-                                        "{} — {}",
-                                        self.username,
-                                        self.opponent
-                                            .as_ref()
-                                            .map(|o| o.0.as_str())
-                                            .unwrap_or("Rakip")
-                                    ));
-                                    ui.label(format!(
-                                        "{:.0}",
-                                        ((self.go_at - self.last_frame) / 1000.0).ceil().max(0.0)
-                                    ));
-                                    if ui.button("Başlamak için tıkla").clicked() {
-                                        self.lock_pointer();
-                                    }
-                                    if ui.button("Lobiye dön").clicked() {
-                                        self.lobby();
-                                    }
-                                }
-                                Screen::Paused => {
-                                    ui.heading("Duraklatıldı");
-                                    if ui.button("Devam et").clicked() {
-                                        self.escape();
-                                    }
-                                    if ui.button("Ayarlar").clicked() {
-                                        self.settings_back = Screen::Paused;
-                                        self.show_screen(Screen::Settings);
-                                    }
-                                    if self.confirm_leave {
-                                        ui.label("Ayrılmak mağlubiyet sayılır");
-                                        if ui.button("Ayrılmayı onayla").clicked() {
-                                            self.confirm_leave = false;
-                                            self.lobby();
-                                        }
-                                    } else if ui.button("Maçtan ayrıl").clicked() {
-                                        if self.mode == Mode::Ranked && self.ranked_started {
-                                            self.confirm_leave = true;
-                                        } else {
-                                            self.lobby();
-                                        }
-                                    }
-                                }
-                                Screen::Settings => {
-                                    self.settings(ui);
-                                    if ui.button("Geri").clicked() {
-                                        self.show_screen(self.settings_back);
-                                    }
-                                }
-                                Screen::Dead => {
-                                    ui.heading("Öldün");
-                                    ui.label(format!(
-                                        "Seni öldürdü: {}",
-                                        self.killed_by.as_deref().unwrap_or("Rakip")
-                                    ));
-                                    if self.mode == Mode::Ranked {
-                                        ui.label(format!(
-                                            "Yeniden doğuş: {:.0}",
-                                            ((self.died_at + 2000.0 - self.last_frame) / 1000.0)
-                                                .ceil()
-                                                .max(0.0)
-                                        ));
-                                    } else if ui.button("Yeniden doğ").clicked() {
-                                        self.lock_pointer();
-                                        self.request("RESPAWN");
-                                    }
-                                    if ui.button("Lobiye dön").clicked() {
-                                        self.lobby();
-                                    }
-                                }
-                                Screen::Result => {
-                                    ui.heading(if self.team == self.winner {
-                                        "ZAFER"
-                                    } else {
-                                        "YENİLGİ"
-                                    });
-                                    ui.label(format!("{} — {}", self.score[0], self.score[1]));
-                                    if ui.button("Lobiye dön").clicked() {
-                                        self.lobby();
-                                    }
-                                }
-                                Screen::RankedResult => {
-                                    if let Some(r) = &self.ranked_result {
-                                        ui.heading(match r.result.as_str() {
-                                            "win" => "ZAFER",
-                                            "loss" => "YENİLGİ",
-                                            _ => "BERABERE",
-                                        });
-                                        ui.label(format!("{} ({:+})", r.rating, r.delta));
-                                    }
-                                    if ui.button("Tekrar sıraya gir").clicked() {
-                                        self.request("QUEUE");
-                                    }
-                                    if ui.button("Lobiye dön").clicked() {
-                                        self.show_screen(Screen::Lobby);
-                                        self.send("INFO".to_owned());
-                                    }
-                                }
-                                Screen::Disconnected => {
-                                    ui.heading("Bağlantı kesildi");
-                                    if ui.button("Yeniden bağlan").clicked() {
-                                        if self.token.is_empty() {
-                                            self.show_screen(Screen::Auth);
-                                        } else if let Err(e) =
-                                            self.connect(format!("TOKEN|{}", self.token), true)
-                                        {
-                                            self.status = e;
-                                        }
-                                    }
-                                    if ui.button("Çıkış").clicked() {
-                                        self.logout();
-                                    }
-                                }
-                                Screen::Playing => {}
-                            }
-                            if self.pending.is_some() {
-                                ui.spinner();
-                            }
-                            ui.label(&self.status);
-                        });
-                    });
-            });
-    }
-
-    fn hud(&self, ctx: &egui::Context) {
-        let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("hud")));
-        let screen = ctx.viewport_rect();
-        let scale = self.hud_scale / 100.0;
-        let text = |pos, anchor, text: &str, size, color| {
-            let font = FontId::proportional(size);
-            painter.text(
-                pos + vec2(1.0, 1.0),
-                anchor,
-                text,
-                font.clone(),
-                Color32::BLACK,
-            );
-            painter.text(pos, anchor, text, font, color);
-        };
-        let in_match = matches!(
-            self.screen,
-            Screen::Playing | Screen::Paused | Screen::Settings
-        );
-        if self.socket.is_some() && (in_match || self.screen == Screen::Dead) {
-            let mut names = self
-                .remote
-                .values()
-                .map(|player| player.name.as_str())
-                .collect::<Vec<_>>();
-            names.sort_unstable();
-            let status = if !self.connected {
-                "Bağlanılıyor…".to_owned()
-            } else if self.health == 0 {
-                "Öldün\nYeniden doğ düğmesine tıkla".to_owned()
-            } else {
-                format!(
-                    "Sen: {}\nDiğerleri: {}",
-                    self.username.trim(),
-                    if names.is_empty() {
-                        "yok".to_owned()
-                    } else {
-                        names.join(", ")
-                    }
-                )
-            };
-            text(
-                screen.min + vec2(12.0, 12.0),
-                Align2::LEFT_TOP,
-                &status,
-                16.0 * scale,
-                TEXT,
-            );
-        }
-        if self.show_fps && in_match {
-            let pos = pos2(screen.right() - 12.0, screen.top() + 12.0);
-            text(
-                pos,
-                Align2::RIGHT_TOP,
-                &format!("FPS: {}", self.fps),
-                16.0 * scale,
-                TEXT,
-            );
-        }
-        if in_match || self.screen == Screen::Dead {
-            let bar = Rect::from_min_size(
-                pos2(screen.left() + 18.0, screen.bottom() - 18.0 - 14.0 * scale),
-                vec2(180.0, 14.0) * scale,
-            );
-            painter.rect_filled(bar, 0.0, Color32::from_rgb(0x1c, 0x08, 0x06));
-            let mut fill = bar;
-            fill.set_width(bar.width() * self.health as f32 / 3.0);
-            painter.rect_filled(fill, 0.0, Color32::from_rgb(0xff, 0x6a, 0x22));
-            painter.rect_stroke(bar, 0.0, Stroke::new(1.0, CRIMSON), StrokeKind::Outside);
-            let label = format!("Can {}/3", self.health);
-            text(
-                bar.left_top() - vec2(0.0, 5.0 * scale),
-                Align2::LEFT_BOTTOM,
-                &label,
-                18.0 * scale,
-                TEXT,
-            );
-        }
-        if self.socket.is_some()
-            && (in_match || matches!(self.screen, Screen::Dead | Screen::Result))
-        {
-            // Each team's kills around the kill target, with the local team marked.
-            let center = pos2(screen.center().x, screen.top() + 43.0);
-            let panel = Rect::from_center_size(center, vec2(330.0, 62.0));
-            painter.rect_filled(panel, 0.0, Color32::from_rgba_unmultiplied(30, 9, 5, 220));
-            painter.rect_stroke(panel, 0.0, Stroke::new(1.0, CRIMSON), StrokeKind::Inside);
-            for (dx, team, score) in [
-                (-105.0, Team::Boys, self.score[0]),
-                (105.0, Team::Girls, self.score[1]),
-            ] {
-                let you = if self.team == Some(team) {
-                    " · SEN"
-                } else {
-                    ""
-                };
-                let label = format!("{}{you}", team.label().to_uppercase());
-                text(
-                    center + vec2(dx, -17.0),
-                    Align2::CENTER_CENTER,
-                    &label,
-                    12.0,
-                    team.color(),
-                );
-                text(
-                    center + vec2(dx, 8.0),
-                    Align2::CENTER_CENTER,
-                    &score.to_string(),
-                    34.0,
-                    team.color(),
-                );
-            }
-            let gray = Color32::from_rgb(0xc8, 0xcc, 0xd4);
-            text(
-                center + vec2(0.0, -12.0),
-                Align2::CENTER_CENTER,
-                "HEDEF",
-                11.0,
-                gray,
-            );
-            text(
-                center + vec2(0.0, 9.0),
-                Align2::CENTER_CENTER,
-                &map::WIN_SCORE.to_string(),
-                20.0,
-                gray,
-            );
-        }
-    }
 }
 
 impl eframe::App for Game {
@@ -2267,12 +1823,27 @@ impl eframe::App for Game {
         let now = ctx.input(|i| i.time) * 1000.0;
         if now - self.fps_since >= 500.0 {
             self.fps = (self.fps_frames as f64 * 1000.0 / (now - self.fps_since)).round() as u32;
+            if matches!(
+                self.screen,
+                Screen::Boot | Screen::Auth | Screen::Lobby | Screen::Queue | Screen::Disconnected
+            ) && self.backdrop_slow < 3
+                && self.fps_frames > 0
+            {
+                self.backdrop_slow = if self.fps < 20 {
+                    self.backdrop_slow + 1
+                } else {
+                    0
+                };
+            }
             self.fps_since = now;
             self.fps_frames = 0;
         }
-        self.fps_frames += 1;
         // Start after WebRunner initialization, which can outlast the server's auth deadline.
-        if self.screen == Screen::Boot && self.socket.is_none() && self.pending.is_none() {
+        if self.screen == Screen::Boot
+            && self.socket.is_none()
+            && self.pending.is_none()
+            && self.target != [0, 0]
+        {
             self.last_frame = now;
             if let Err(error) = self.connect(format!("TOKEN|{}", self.token), true) {
                 self.status = error;
@@ -2351,6 +1922,7 @@ impl eframe::App for Game {
         }
         self.menu(&ctx);
         self.hud(&ctx);
+        self.toast_stack(&ctx);
         // eframe schedules this through requestAnimationFrame; never block the browser.
         if self.fps_limit == 0 {
             ctx.request_repaint();
@@ -2362,7 +1934,7 @@ impl eframe::App for Game {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.08, 0.11, 0.16, 1.0]
+        ui::BG.to_normalized_gamma_f32()
     }
 }
 
