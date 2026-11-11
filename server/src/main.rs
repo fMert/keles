@@ -26,10 +26,17 @@ const MAX_CONNECTIONS: usize = 160;
 const MAX_PER_IP: usize = 4;
 const MAX_HEALTH: u8 = 3;
 const ROUND_RESET: Duration = Duration::from_secs(10);
+const RANKED_KILLS: u32 = 10;
+const RANKED_SECONDS: u64 = 300;
+const COUNTDOWN: u64 = 3;
 
 struct Player {
     key: String,
-    playing: bool,
+    place: Place,
+    kills: u32,
+    deaths: u32,
+    died_at: Option<Instant>,
+    failed: bool,
     name: String,
     x: f32,
     z: f32,
@@ -41,12 +48,38 @@ struct Player {
     outgoing: SyncSender<String>,
 }
 
-struct World {
-    players: HashMap<u32, Player>,
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Place {
+    Lobby,
+    Queue(Instant),
+    Deathmatch,
+    Ranked(u32),
+}
+
+#[derive(Default)]
+struct Room {
     boys: u32,
     girls: u32,
     winner: Option<&'static str>,
     reset_at: Option<Instant>,
+}
+
+struct Ranked {
+    room: Room,
+    players: [u32; 2],
+    keys: [String; 2],
+    go_at: Instant,
+    ends_at: Instant,
+    started: bool,
+    pending: Option<(Option<u32>, &'static str)>,
+    retry_at: Instant,
+}
+
+struct World {
+    players: HashMap<u32, Player>,
+    deathmatch: Room,
+    matches: HashMap<u32, Ranked>,
+    next_match: u32,
     accounts: HashMap<String, Account>,
     sessions: HashMap<String, String>,
     auth_attempts: HashMap<IpAddr, (Instant, u32)>,
@@ -58,10 +91,9 @@ impl World {
     fn new(data_path: PathBuf) -> std::io::Result<Self> {
         Ok(Self {
             players: HashMap::new(),
-            boys: 0,
-            girls: 0,
-            winner: None,
-            reset_at: None,
+            deathmatch: Room::default(),
+            matches: HashMap::new(),
+            next_match: 1,
             accounts: accounts::load(&data_path)?,
             sessions: HashMap::new(),
             auth_attempts: HashMap::new(),
@@ -195,7 +227,11 @@ fn authenticate(
         Player {
             key,
             name,
-            playing: false,
+            place: Place::Lobby,
+            kills: 0,
+            deaths: 0,
+            died_at: None,
+            failed: false,
             x: 0.0,
             z: 0.0,
             y: 0.0,
@@ -214,10 +250,19 @@ fn info(world: &World, id: u32) {
         return;
     };
     let a = &world.accounts[&player.key];
-    let dm = world.players.values().filter(|p| p.playing).count();
+    let dm = world
+        .players
+        .values()
+        .filter(|p| p.place == Place::Deathmatch)
+        .count();
     let _ = player.outgoing.try_send(format!(
-        "INFO|{}|{dm}|0|{}|{}|{}",
+        "INFO|{}|{dm}|{}|{}|{}|{}",
         world.players.len(),
+        world
+            .players
+            .values()
+            .filter(|p| matches!(p.place, Place::Queue(_)))
+            .count(),
         a.rating,
         a.wins,
         a.losses
@@ -242,11 +287,66 @@ fn info(world: &World, id: u32) {
     let _ = player.outgoing.try_send(format!("TOP|{top}"));
 }
 
+fn add_message(id: u32, p: &Player) -> String {
+    format!(
+        "ADD|{id}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        p.name, p.x, p.z, p.y, p.yaw, p.health, p.team, p.kills, p.deaths
+    )
+}
+
+fn enter(world: &mut World, id: u32, place: Place, team: &'static str, rng: &mut Rng) {
+    let existing: Vec<_> = world
+        .players
+        .iter()
+        .filter(|(&other, p)| other != id && p.place == place)
+        .map(|(&id, p)| add_message(id, p))
+        .collect();
+    let (x, z, y) = team_spawn(team, rng);
+    let p = world.players.get_mut(&id).unwrap();
+    (p.x, p.z, p.y, p.yaw, p.health, p.team, p.place) = (
+        x,
+        z,
+        y,
+        -std::f32::consts::FRAC_PI_2,
+        MAX_HEALTH,
+        team,
+        place,
+    );
+    (p.kills, p.deaths, p.died_at) = (0, 0, None);
+    let _ = p
+        .outgoing
+        .try_send(format!("WELCOME|{id}|{x}|{z}|{y}|{MAX_HEALTH}|{team}"));
+    if place == Place::Deathmatch {
+        let room = &world.deathmatch;
+        let _ = p
+            .outgoing
+            .try_send(format!("SCORE|{}|{}", room.boys, room.girls));
+        if let Some(winner) = room.winner {
+            let remaining = room
+                .reset_at
+                .unwrap()
+                .saturating_duration_since(Instant::now())
+                .as_secs()
+                + 1;
+            let _ = p.outgoing.try_send(format!("WIN|{winner}|{remaining}"));
+        }
+    }
+    for text in existing {
+        let _ = p.outgoing.try_send(text);
+    }
+    let add = add_message(id, p);
+    broadcast(&mut world.players, place, id, &add);
+}
+
 fn play(world: &mut World, id: u32, rng: &mut Rng) {
-    if world.players[&id].playing {
+    if world.players[&id].place != Place::Lobby {
         return;
     }
-    let count = world.players.values().filter(|p| p.playing).count();
+    let count = world
+        .players
+        .values()
+        .filter(|p| p.place == Place::Deathmatch)
+        .count();
     if count >= MAX_PLAYERS {
         let _ = world.players[&id]
             .outgoing
@@ -256,54 +356,15 @@ fn play(world: &mut World, id: u32, rng: &mut Rng) {
     let boys = world
         .players
         .values()
-        .filter(|p| p.playing && p.team == "boys")
+        .filter(|p| p.place == Place::Deathmatch && p.team == "boys")
         .count();
-    let team = choose_team(boys, count - boys, rng);
-    let (x, z, y) = team_spawn(team, rng);
-    let existing: Vec<_> = world
-        .players
-        .iter()
-        .filter(|(_, p)| p.playing)
-        .map(|(&id, p)| {
-            format!(
-                "ADD|{id}|{}|{}|{}|{}|{}|{}|{}",
-                p.name, p.x, p.z, p.y, p.yaw, p.health, p.team
-            )
-        })
-        .collect();
-    let p = world.players.get_mut(&id).unwrap();
-    (p.x, p.z, p.y, p.yaw, p.health, p.team, p.playing) = (
-        x,
-        z,
-        y,
-        -std::f32::consts::FRAC_PI_2,
-        MAX_HEALTH,
-        team,
-        true,
+    enter(
+        world,
+        id,
+        Place::Deathmatch,
+        choose_team(boys, count - boys, rng),
+        rng,
     );
-    let _ = p
-        .outgoing
-        .try_send(format!("WELCOME|{id}|{x}|{z}|{y}|{MAX_HEALTH}|{team}"));
-    let _ = p
-        .outgoing
-        .try_send(format!("SCORE|{}|{}", world.boys, world.girls));
-    if let Some(winner) = world.winner {
-        let remaining = world
-            .reset_at
-            .unwrap()
-            .saturating_duration_since(Instant::now())
-            .as_secs()
-            + 1;
-        let _ = p.outgoing.try_send(format!("WIN|{winner}|{remaining}"));
-    }
-    for text in existing {
-        let _ = p.outgoing.try_send(text);
-    }
-    let add = format!(
-        "ADD|{id}|{}|{x}|{z}|{y}|-1.5707964|{MAX_HEALTH}|{team}",
-        p.name
-    );
-    broadcast(&mut world.players, id, &add);
 }
 
 type Shared = Arc<Mutex<World>>;
@@ -357,48 +418,374 @@ fn choose_team(boys: usize, girls: usize, rng: &mut Rng) -> &'static str {
 
 // A client whose queue is full has fallen behind; dropping it beats letting it
 // miss state such as HP, SCORE or LEAVE.
-fn broadcast(players: &mut HashMap<u32, Player>, except: u32, message: &str) {
-    players.retain(|&id, player| {
-        !player.playing || id == except || player.outgoing.try_send(message.to_owned()).is_ok()
-    });
+fn broadcast(players: &mut HashMap<u32, Player>, place: Place, except: u32, message: &str) {
+    for (&id, p) in players.iter_mut() {
+        if p.place == place && id != except && p.outgoing.try_send(message.to_owned()).is_err() {
+            p.failed = true;
+        }
+    }
 }
 
-// Called from every connection loop; the first thread to see the deadline
-// resets the round for everyone.
-fn maybe_reset(world: &mut World, rng: &mut Rng) {
-    let Some(at) = world.reset_at else {
+fn active(world: &World, id: u32) -> Option<Place> {
+    let p = world.players.get(&id)?;
+    match p.place {
+        Place::Deathmatch if world.deathmatch.winner.is_none() => Some(p.place),
+        Place::Ranked(id)
+            if world.matches.get(&id).is_some_and(|m| {
+                m.started && m.pending.is_none() && Instant::now() < m.ends_at
+            }) =>
+        {
+            Some(p.place)
+        }
+        _ => None,
+    }
+}
+
+fn leave(world: &mut World, id: u32) {
+    let Some(place) = world.players.get(&id).map(|p| p.place) else {
         return;
     };
-    if Instant::now() < at {
-        return;
+    if let Place::Ranked(match_id) = place {
+        if let Some(m) = world.matches.get(&match_id) {
+            let winner = m.players.iter().copied().find(|&other| other != id);
+            let (winner, reason) = if m.started {
+                (winner, "forfeit")
+            } else {
+                (None, "cancelled")
+            };
+            finish_ranked(world, match_id, winner, reason);
+        }
+    } else if place == Place::Deathmatch {
+        broadcast(&mut world.players, place, id, &format!("LEAVE|{id}"));
     }
-    world.boys = 0;
-    world.girls = 0;
-    world.winner = None;
-    world.reset_at = None;
-    let mut moves = Vec::new();
-    for (&id, player) in world.players.iter_mut() {
-        if !player.playing {
+    if let Some(p) = world.players.get_mut(&id) {
+        p.place = Place::Lobby;
+    }
+}
+
+fn finish_ranked(world: &mut World, match_id: u32, winner: Option<u32>, reason: &'static str) {
+    let Some(m) = world.matches.get_mut(&match_id) else {
+        return;
+    };
+    let (winner, reason) = *m.pending.get_or_insert((winner, reason));
+    let players = m.players;
+    let keys = m.keys.clone();
+    let old = [
+        world.accounts[&keys[0]].rating,
+        world.accounts[&keys[1]].rating,
+    ];
+    let mut updated = world.accounts.clone();
+    for i in 0..2 {
+        if reason == "cancelled" {
             continue;
         }
-        let (x, z, y) = team_spawn(player.team, rng);
-        player.x = x;
-        player.z = z;
-        player.y = y;
-        player.yaw = -std::f32::consts::FRAC_PI_2;
-        player.health = MAX_HEALTH;
-        let _ = player.outgoing.try_send(format!("AT|{x}|{y}|{z}"));
-        moves.push((id, x, z, y));
+        let score = match winner {
+            Some(id) if id == players[i] => 1.0,
+            Some(_) => 0.0,
+            None => 0.5,
+        };
+        let a = updated.get_mut(&keys[i]).unwrap();
+        a.rating = accounts::elo(old[i], old[1 - i], score);
+        // shortcut: the six-field format cannot count draws; draw-only accounts enter TOP after a decisive game.
+        a.wins += u32::from(score > 0.5);
+        a.losses += u32::from(score < 0.5);
     }
-    for (id, x, z, y) in moves {
-        broadcast(&mut world.players, 0, &format!("HP|{id}|{MAX_HEALTH}"));
-        broadcast(
-            &mut world.players,
-            id,
-            &format!("MOVE|{id}|{x}|{z}|{y}|-1.5707964"),
+    if reason != "cancelled" {
+        if let Err(error) = accounts::save(&world.data_path, &updated) {
+            eprintln!("Dereceli sonuç kaydedilemedi: {error}");
+            m.retry_at = Instant::now() + Duration::from_secs(5);
+            return;
+        }
+        world.accounts = updated;
+    }
+    world.matches.remove(&match_id);
+    for i in 0..2 {
+        if let Some(p) = world.players.get_mut(&players[i]) {
+            p.place = Place::Lobby;
+            let a = &world.accounts[&keys[i]];
+            let result = match winner {
+                Some(id) if id == players[i] => "win",
+                Some(_) => "loss",
+                None => "draw",
+            };
+            let delta = a.rating as i64 - old[i] as i64;
+            if p.outgoing
+                .try_send(format!(
+                    "RANKED_END|{result}|{reason}|{}|{delta:+}|{}|{}",
+                    a.rating, a.wins, a.losses
+                ))
+                .is_err()
+            {
+                p.failed = true;
+            }
+        }
+    }
+}
+
+fn tick(world: &mut World, rng: &mut Rng) {
+    let now = Instant::now();
+    if world.deathmatch.reset_at.is_some_and(|at| now >= at) {
+        world.deathmatch = Room::default();
+        let ids: Vec<_> = world
+            .players
+            .iter()
+            .filter(|(_, p)| p.place == Place::Deathmatch)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ids {
+            let p = world.players.get_mut(&id).unwrap();
+            (p.kills, p.deaths) = (0, 0);
+            revive(world, id, rng);
+        }
+        broadcast(&mut world.players, Place::Deathmatch, 0, "SCORE|0|0");
+    }
+    let failed: Vec<_> = world
+        .players
+        .iter()
+        .filter(|(_, p)| p.failed)
+        .map(|(&id, _)| id)
+        .collect();
+    for id in failed {
+        leave(world, id);
+        world.players.remove(&id);
+    }
+    let matches: Vec<_> = world.matches.keys().copied().collect();
+    for id in matches {
+        let m = world.matches.get_mut(&id).unwrap();
+        if let Some((winner, reason)) = m.pending {
+            if now >= m.retry_at {
+                finish_ranked(world, id, winner, reason);
+            }
+        } else if !m.started && now >= m.go_at {
+            m.started = true;
+            broadcast(&mut world.players, Place::Ranked(id), 0, "GO");
+        } else if m.started && now >= m.ends_at {
+            let winner = if m.room.boys == m.room.girls {
+                None
+            } else {
+                let team = if m.room.boys > m.room.girls {
+                    "boys"
+                } else {
+                    "girls"
+                };
+                m.players
+                    .iter()
+                    .copied()
+                    .find(|id| world.players.get(id).is_some_and(|p| p.team == team))
+            };
+            finish_ranked(world, id, winner, "time");
+        }
+    }
+    let mut queue: Vec<_> = world
+        .players
+        .iter()
+        .filter_map(|(&id, p)| {
+            if let Place::Queue(at) = p.place {
+                Some((at, id))
+            } else {
+                None
+            }
+        })
+        .collect();
+    queue.sort_unstable();
+    for &(at, id) in &queue {
+        if !matches!(world.players[&id].place, Place::Queue(_)) {
+            continue;
+        }
+        let rating = world.accounts[&world.players[&id].key].rating;
+        let other = queue.iter().find_map(|&(other_at, other)| {
+            let p = &world.players[&other];
+            let range =
+                (100 + 50 * (now.duration_since(at.min(other_at)).as_secs() / 10)).min(1000) as u32;
+            (id != other
+                && matches!(p.place, Place::Queue(_))
+                && (p.ip != world.players[&id].ip || p.ip.is_loopback())
+                && rating.abs_diff(world.accounts[&p.key].rating) <= range)
+                .then_some(other)
+        });
+        let Some(other) = other else {
+            continue;
+        };
+        let match_id = world.next_match;
+        world.next_match += 1;
+        let players = [id, other];
+        let keys = players.map(|id| world.players[&id].key.clone());
+        let go_at = now + Duration::from_secs(COUNTDOWN);
+        world.matches.insert(
+            match_id,
+            Ranked {
+                room: Room::default(),
+                players,
+                keys,
+                go_at,
+                ends_at: go_at + Duration::from_secs(RANKED_SECONDS),
+                started: false,
+                pending: None,
+                retry_at: now,
+            },
         );
+        let first_boys = rng.next_u64() & 1 == 0;
+        for i in 0..2 {
+            let p = &world.players[&players[i]];
+            let opponent = &world.players[&players[1 - i]];
+            let _ = p.outgoing.try_send(format!(
+                "MATCH|{}|{}|{}|{RANKED_KILLS}|{RANKED_SECONDS}|{COUNTDOWN}",
+                opponent.name, world.accounts[&opponent.key].rating, world.accounts[&p.key].rating
+            ));
+        }
+        for (i, &player) in players.iter().enumerate() {
+            enter(
+                world,
+                player,
+                Place::Ranked(match_id),
+                if (i == 0) == first_boys {
+                    "boys"
+                } else {
+                    "girls"
+                },
+                rng,
+            );
+        }
+        broadcast(&mut world.players, Place::Ranked(match_id), 0, "SCORE|0|0");
     }
-    broadcast(&mut world.players, 0, "SCORE|0|0");
+}
+
+fn revive(world: &mut World, id: u32, rng: &mut Rng) {
+    let p = world.players.get_mut(&id).unwrap();
+    let place = p.place;
+    let (x, z, y) = team_spawn(p.team, rng);
+    (p.x, p.z, p.y, p.yaw, p.health, p.died_at) =
+        (x, z, y, -std::f32::consts::FRAC_PI_2, MAX_HEALTH, None);
+    if p.outgoing.try_send(format!("AT|{x}|{y}|{z}")).is_err() {
+        p.failed = true;
+    }
+    broadcast(
+        &mut world.players,
+        place,
+        0,
+        &format!("HP|{id}|{MAX_HEALTH}"),
+    );
+    broadcast(
+        &mut world.players,
+        place,
+        id,
+        &format!("MOVE|{id}|{x}|{z}|{y}|-1.5707964"),
+    );
+}
+
+fn respawn(world: &mut World, id: u32, rng: &mut Rng) {
+    let Some(place) = active(world, id) else {
+        return;
+    };
+    let p = &world.players[&id];
+    if p.health != 0
+        || (matches!(place, Place::Ranked(_))
+            && p.died_at
+                .is_none_or(|at| at.elapsed() < Duration::from_secs(2)))
+    {
+        return;
+    }
+    revive(world, id, rng);
+}
+
+fn fire(world: &mut World, id: u32, yaw: f32, pitch: f32) {
+    let Some(place) = active(world, id) else {
+        return;
+    };
+    let p = &world.players[&id];
+    if p.health == 0 {
+        return;
+    }
+    let team = p.team;
+    let origin = [p.x, p.y + 1.7, p.z];
+    let direction = [
+        yaw.cos() * pitch.cos(),
+        pitch.sin(),
+        yaw.sin() * pitch.cos(),
+    ];
+    let mut nearest = map::ray_map(origin, direction);
+    let mut hit = None;
+    for (&target_id, target) in &world.players {
+        if target_id == id || target.place != place || target.health == 0 || target.team == team {
+            continue;
+        }
+        if let Some(distance) = ray_box(
+            origin,
+            direction,
+            [target.x - 0.35, target.y, target.z - 0.35],
+            [target.x + 0.35, target.y + 1.9, target.z + 0.35],
+        ) {
+            if distance < nearest {
+                nearest = distance;
+                hit = Some(target_id);
+            }
+        }
+    }
+    let Some(target_id) = hit else {
+        return;
+    };
+    let _ = world.players[&id].outgoing.try_send("HITMARK".to_owned());
+    let target = world.players.get_mut(&target_id).unwrap();
+    target.health -= 1;
+    let health = target.health;
+    if health == 0 {
+        target.deaths += 1;
+        target.died_at = Some(Instant::now());
+    }
+    broadcast(
+        &mut world.players,
+        place,
+        0,
+        &format!("HP|{target_id}|{health}"),
+    );
+    if health != 0 {
+        return;
+    }
+    world.players.get_mut(&id).unwrap().kills += 1;
+    broadcast(
+        &mut world.players,
+        place,
+        0,
+        &format!("KILL|{id}|{target_id}"),
+    );
+    let room = match place {
+        Place::Deathmatch => &mut world.deathmatch,
+        Place::Ranked(id) => &mut world.matches.get_mut(&id).unwrap().room,
+        _ => return,
+    };
+    if team == "girls" {
+        room.girls += 1;
+    } else {
+        room.boys += 1;
+    }
+    let (boys, girls) = (room.boys, room.girls);
+    broadcast(
+        &mut world.players,
+        place,
+        0,
+        &format!("SCORE|{boys}|{girls}"),
+    );
+    match place {
+        Place::Deathmatch if boys >= map::WIN_SCORE || girls >= map::WIN_SCORE => {
+            let winner = if boys >= map::WIN_SCORE {
+                "boys"
+            } else {
+                "girls"
+            };
+            world.deathmatch.winner = Some(winner);
+            world.deathmatch.reset_at = Some(Instant::now() + ROUND_RESET);
+            broadcast(
+                &mut world.players,
+                place,
+                0,
+                &format!("WIN|{winner}|{}", ROUND_RESET.as_secs()),
+            );
+        }
+        Place::Ranked(match_id) if boys >= RANKED_KILLS || girls >= RANKED_KILLS => {
+            finish_ranked(world, match_id, Some(id), "kills")
+        }
+        _ => {}
+    }
 }
 
 // Adapted from aevyrie/bevy_mod_raycast/src/primitives.rs, intersects_aabb,
@@ -482,6 +869,13 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
         let mut last_info = last_fire;
         let (mut last_heard, mut last_ping) = (Instant::now(), Instant::now());
         'connected: loop {
+            {
+                let mut world = shared.lock().unwrap();
+                tick(&mut world, &mut rng);
+                if !world.players.contains_key(&id) {
+                    break;
+                }
+            }
             // Browsers answer pings on their own, even while paused, so silence
             // means a dead link that would otherwise keep the slot and nickname.
             if last_heard.elapsed() > Duration::from_secs(15) {
@@ -526,17 +920,30 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                                 play(&mut world, id, &mut rng);
                                 continue;
                             }
-                            "LOBBY" => {
-                                if world.players[&id].playing {
-                                    world.players.get_mut(&id).unwrap().playing = false;
-                                    broadcast(&mut world.players, id, &format!("LEAVE|{id}"));
+                            "QUEUE" => {
+                                if world.players[&id].place == Place::Lobby {
+                                    let p = world.players.get_mut(&id).unwrap();
+                                    p.place = Place::Queue(Instant::now());
+                                    let _ = p.outgoing.try_send("QUEUED".to_owned());
                                 }
+                                continue;
+                            }
+                            "UNQUEUE" => {
+                                if matches!(world.players[&id].place, Place::Queue(_)) {
+                                    let p = world.players.get_mut(&id).unwrap();
+                                    p.place = Place::Lobby;
+                                    let _ = p.outgoing.try_send("UNQUEUED".to_owned());
+                                }
+                                continue;
+                            }
+                            "LOBBY" => {
+                                leave(&mut world, id);
                                 info(&world, id);
                                 continue;
                             }
                             _ => {}
                         }
-                        if !world.players[&id].playing {
+                        if active(&world, id).is_none() {
                             continue;
                         }
                     }
@@ -581,6 +988,9 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                             // the hitbox follows them.
                             let y = feet.clamp(floor, floor + 1.0);
                             let mut world = shared.lock().unwrap();
+                            let Some(place) = active(&world, id) else {
+                                continue;
+                            };
                             let Some(player) = world.players.get_mut(&id) else {
                                 continue;
                             };
@@ -598,6 +1008,7 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                             player.yaw = yaw;
                             broadcast(
                                 &mut world.players,
+                                place,
                                 id,
                                 &format!("MOVE|{id}|{x}|{z}|{y}|{yaw}"),
                             );
@@ -621,116 +1032,14 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                                 continue;
                             }
                             let mut world = shared.lock().unwrap();
-                            if world.winner.is_some() {
-                                continue;
-                            }
-                            let Some((sx, sz, sy, health, team)) = world
-                                .players
-                                .get(&id)
-                                .map(|p| (p.x, p.z, p.y, p.health, p.team))
-                            else {
-                                continue;
-                            };
-                            if health == 0 {
-                                continue;
-                            }
-                            last_fire = Instant::now();
-                            let origin = [sx, sy + 1.7, sz];
-                            let direction = [
-                                yaw.cos() * pitch.cos(),
-                                pitch.sin(),
-                                yaw.sin() * pitch.cos(),
-                            ];
-                            let mut nearest = map::ray_map(origin, direction);
-                            let mut hit = None;
-                            for (&target_id, target) in world.players.iter() {
-                                if target_id == id
-                                    || !target.playing
-                                    || target.health == 0
-                                    || target.team == team
-                                {
-                                    continue;
-                                }
-                                if let Some(distance) = ray_box(
-                                    origin,
-                                    direction,
-                                    [target.x - 0.35, target.y, target.z - 0.35],
-                                    [target.x + 0.35, target.y + 1.9, target.z + 0.35],
-                                ) {
-                                    if distance < nearest {
-                                        nearest = distance;
-                                        hit = Some(target_id);
-                                    }
-                                }
-                            }
-                            if let Some(target_id) = hit {
-                                let target_health = {
-                                    let target = world.players.get_mut(&target_id).unwrap();
-                                    target.health -= 1;
-                                    target.health
-                                };
-                                broadcast(
-                                    &mut world.players,
-                                    0,
-                                    &format!("HP|{target_id}|{target_health}"),
-                                );
-                                if target_health == 0 {
-                                    if team == "girls" {
-                                        world.girls += 1;
-                                    } else {
-                                        world.boys += 1;
-                                    }
-                                    let (boys, girls) = (world.boys, world.girls);
-                                    broadcast(
-                                        &mut world.players,
-                                        0,
-                                        &format!("SCORE|{boys}|{girls}"),
-                                    );
-                                    if boys >= map::WIN_SCORE || girls >= map::WIN_SCORE {
-                                        let winner = if boys >= map::WIN_SCORE {
-                                            "boys"
-                                        } else {
-                                            "girls"
-                                        };
-                                        world.winner = Some(winner);
-                                        world.reset_at = Some(Instant::now() + ROUND_RESET);
-                                        broadcast(
-                                            &mut world.players,
-                                            0,
-                                            &format!("WIN|{winner}|{}", ROUND_RESET.as_secs()),
-                                        );
-                                    }
-                                }
+                            if active(&world, id).is_some() {
+                                last_fire = Instant::now();
+                                fire(&mut world, id, yaw, pitch);
                             }
                         }
                         Some("RESPAWN") => {
                             let mut world = shared.lock().unwrap();
-                            if world.winner.is_some() {
-                                continue;
-                            }
-                            let Some(player) = world.players.get(&id) else {
-                                continue;
-                            };
-                            if player.health != 0 {
-                                continue;
-                            }
-                            let team = player.team;
-                            let (x, z, y) = team_spawn(team, &mut rng);
-                            {
-                                let player = world.players.get_mut(&id).unwrap();
-                                player.x = x;
-                                player.z = z;
-                                player.y = y;
-                                player.yaw = -std::f32::consts::FRAC_PI_2;
-                                player.health = MAX_HEALTH;
-                                let _ = player.outgoing.try_send(format!("AT|{x}|{y}|{z}"));
-                            }
-                            broadcast(&mut world.players, 0, &format!("HP|{id}|{MAX_HEALTH}"));
-                            broadcast(
-                                &mut world.players,
-                                id,
-                                &format!("MOVE|{id}|{x}|{z}|{y}|-1.5707964"),
-                            );
+                            respawn(&mut world, id, &mut rng);
                         }
                         _ => {}
                     }
@@ -748,13 +1057,12 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
             if !world.players.contains_key(&id) {
                 break;
             }
-            maybe_reset(&mut world, &mut rng);
+            tick(&mut world, &mut rng);
         }
     }
     let mut world = shared.lock().unwrap();
-    if world.players.remove(&id).is_some_and(|p| p.playing) {
-        broadcast(&mut world.players, id, &format!("LEAVE|{id}"));
-    }
+    leave(&mut world, id);
+    world.players.remove(&id);
 }
 
 #[cfg(test)]
@@ -822,6 +1130,168 @@ mod tests {
         assert!(choices.contains(&"boys") && choices.contains(&"girls"));
     }
 
+    fn ranked_world() -> (World, [mpsc::Receiver<String>; 3]) {
+        let mut world = World::new(test_path()).unwrap();
+        let hash = accounts::hash("password1").unwrap();
+        let receivers = std::array::from_fn(|i| {
+            let id = i as u32 + 1;
+            let name = format!("Player{id}");
+            let key = name.to_ascii_lowercase();
+            world.accounts.insert(
+                key.clone(),
+                Account {
+                    name: name.clone(),
+                    hash: hash.clone(),
+                    rating: 1000,
+                    wins: 0,
+                    losses: 0,
+                },
+            );
+            let (outgoing, receiver) = mpsc::sync_channel(128);
+            world.players.insert(
+                id,
+                Player {
+                    key,
+                    name,
+                    place: if id < 3 {
+                        Place::Queue(Instant::now())
+                    } else {
+                        Place::Lobby
+                    },
+                    kills: 0,
+                    deaths: 0,
+                    died_at: None,
+                    failed: false,
+                    x: 0.0,
+                    z: 0.0,
+                    y: 0.0,
+                    yaw: 0.0,
+                    health: 3,
+                    team: "boys",
+                    ip: "127.0.0.1".parse().unwrap(),
+                    outgoing,
+                },
+            );
+            receiver
+        });
+        (world, receivers)
+    }
+
+    #[test]
+    fn ranked_pairing_countdown_kills_rating_and_isolation() {
+        let (mut world, rx) = ranked_world();
+        let mut rng = Rng::new(7);
+        tick(&mut world, &mut rng);
+        assert_eq!(world.matches.len(), 1);
+        assert_ne!(world.players[&1].team, world.players[&2].team);
+        for receiver in &rx[..2] {
+            let messages: Vec<_> = receiver.try_iter().collect();
+            assert!(messages[0].starts_with("MATCH|"));
+            assert!(messages[1].starts_with("WELCOME|"));
+            assert!(messages.iter().any(|m| m.starts_with("ADD|")));
+            assert_eq!(messages.last().unwrap(), "SCORE|0|0");
+        }
+        let (x, z, y) = team_spawn("boys", &mut rng);
+        for (id, offset) in [(1, 0.0), (2, 0.8)] {
+            let p = world.players.get_mut(&id).unwrap();
+            (p.x, p.z, p.y) = (x + offset, z, y);
+        }
+        fire(&mut world, 1, 0.0, 0.0);
+        assert_eq!(world.players[&2].health, 3, "countdown ignores fire");
+        let m = world.matches.get_mut(&1).unwrap();
+        m.go_at = Instant::now() - Duration::from_secs(1);
+        tick(&mut world, &mut rng);
+        assert_eq!(rx[0].try_recv().unwrap(), "GO");
+        assert_eq!(rx[1].try_recv().unwrap(), "GO");
+        world.players.get_mut(&2).unwrap().health = 1;
+        world.players.get_mut(&1).unwrap().kills = 9;
+        let room = &mut world.matches.get_mut(&1).unwrap().room;
+        if world.players[&1].team == "boys" {
+            room.boys = 9;
+        } else {
+            room.girls = 9;
+        }
+        fire(&mut world, 1, 0.0, 0.0);
+        assert!(world.matches.is_empty());
+        assert_eq!(world.accounts["player1"].rating, 1016);
+        assert_eq!(world.accounts["player2"].rating, 984);
+        let messages: Vec<_> = rx[0].try_iter().collect();
+        assert!(messages.iter().any(|m| m == "HITMARK"));
+        assert!(messages.iter().any(|m| m == "KILL|1|2"));
+        assert!(messages
+            .iter()
+            .any(|m| m == "RANKED_END|win|kills|1016|+16|1|0"));
+        assert!(rx[1]
+            .try_iter()
+            .any(|m| m == "RANKED_END|loss|kills|984|-16|0|1"));
+        assert!(rx[2].try_recv().is_err(), "lobby gets no room traffic");
+        assert_eq!(accounts::load(&world.data_path).unwrap(), world.accounts);
+        play(&mut world, 1, &mut rng);
+        broadcast(&mut world.players, Place::Deathmatch, 0, "MOVE|1|0|0|0|0");
+        assert!(
+            rx[2].try_recv().is_err(),
+            "lobby gets no deathmatch movement"
+        );
+        std::fs::remove_file(&world.data_path).unwrap();
+    }
+
+    #[test]
+    fn ranked_leaving_cancels_or_forfeits_and_timeout_draws() {
+        for started in [false, true] {
+            let (mut world, rx) = ranked_world();
+            tick(&mut world, &mut Rng::new(7));
+            for r in &rx {
+                r.try_iter().for_each(drop);
+            }
+            world.matches.get_mut(&1).unwrap().started = started;
+            leave(&mut world, 1);
+            world.players.remove(&1);
+            let expected = if started {
+                "RANKED_END|win|forfeit|1016|+16|1|0"
+            } else {
+                "RANKED_END|draw|cancelled|1000|+0|0|0"
+            };
+            assert_eq!(rx[1].try_recv().unwrap(), expected);
+            assert_eq!(world.players[&2].place, Place::Lobby);
+            if started {
+                std::fs::remove_file(&world.data_path).unwrap();
+            }
+        }
+        let (mut world, rx) = ranked_world();
+        tick(&mut world, &mut Rng::new(7));
+        for r in &rx {
+            r.try_iter().for_each(drop);
+        }
+        let m = world.matches.get_mut(&1).unwrap();
+        m.started = true;
+        m.ends_at = Instant::now() - Duration::from_secs(1);
+        tick(&mut world, &mut Rng::new(7));
+        assert!(rx[0]
+            .try_recv()
+            .unwrap()
+            .starts_with("RANKED_END|draw|time|1000|+0|"));
+        assert_eq!(world.accounts["player1"].rating, 1000);
+        std::fs::remove_file(&world.data_path).unwrap();
+    }
+
+    #[test]
+    fn queue_rating_window_and_same_ip_guard() {
+        let (mut world, _rx) = ranked_world();
+        world.players.get_mut(&1).unwrap().ip = "192.0.2.1".parse().unwrap();
+        world.players.get_mut(&2).unwrap().ip = "192.0.2.1".parse().unwrap();
+        tick(&mut world, &mut Rng::new(7));
+        assert!(world.matches.is_empty());
+        world.players.get_mut(&2).unwrap().ip = "192.0.2.2".parse().unwrap();
+        world.accounts.get_mut("player2").unwrap().rating = 1200;
+        tick(&mut world, &mut Rng::new(7));
+        assert!(world.matches.is_empty());
+        world.players.get_mut(&1).unwrap().place =
+            Place::Queue(Instant::now() - Duration::from_secs(20));
+        tick(&mut world, &mut Rng::new(7));
+        assert_eq!(world.matches.len(), 1);
+        assert_eq!(world.matches[&1].players[0], 1, "oldest waiter first");
+    }
+
     #[test]
     fn websocket_join_movement_damage_and_rejections() {
         let shared = Arc::new(Mutex::new(World::new(test_path()).unwrap()));
@@ -836,7 +1306,7 @@ mod tests {
             });
             let stream = TcpStream::connect(address).unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(3)))
+                .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
             let (socket, _) = tungstenite::client(format!("ws://{address}/keles"), stream).unwrap();
             (socket, handle)
@@ -914,7 +1384,11 @@ mod tests {
                     Player {
                         name: format!("Player{id}"),
                         key: format!("player{id}"),
-                        playing: true,
+                        place: Place::Deathmatch,
+                        kills: 0,
+                        deaths: 0,
+                        died_at: None,
+                        failed: false,
                         x,
                         z,
                         y,
@@ -939,7 +1413,11 @@ mod tests {
         let player = |team, outgoing| Player {
             name: String::new(),
             key: String::new(),
-            playing: true,
+            place: Place::Deathmatch,
+            kills: 0,
+            deaths: 0,
+            died_at: None,
+            failed: false,
             x: 0.0,
             z: 0.0,
             y: 0.0,
@@ -958,16 +1436,18 @@ mod tests {
                 (2, player("boys", other_sender)),
                 (3, player("boys", full_sender)),
             ]),
-            boys: 39,
-            girls: 40,
-            winner: Some("girls"),
-            reset_at: Some(Instant::now() - Duration::from_secs(1)),
+            deathmatch: Room {
+                boys: 39,
+                girls: 40,
+                winner: Some("girls"),
+                reset_at: Some(Instant::now() - Duration::from_secs(1)),
+            },
             ..World::new(test_path()).unwrap()
         };
         let mut rng = Rng::new(7);
-        maybe_reset(&mut world, &mut rng);
-        assert_eq!((world.boys, world.girls), (0, 0));
-        assert!(world.winner.is_none() && world.reset_at.is_none());
+        tick(&mut world, &mut rng);
+        assert_eq!((world.deathmatch.boys, world.deathmatch.girls), (0, 0));
+        assert!(world.deathmatch.winner.is_none() && world.deathmatch.reset_at.is_none());
         assert_eq!(world.players[&1].health, MAX_HEALTH);
         assert!(
             !world.players.contains_key(&3),
