@@ -18,6 +18,39 @@ mod map;
 use map::Map;
 #[cfg(target_arch = "wasm32")]
 mod web;
+#[cfg(not(target_arch = "wasm32"))]
+mod web {
+    pub fn storage_get(_: &str) -> Option<String> {
+        None
+    }
+    pub fn storage_set(_: &str, _: &str) {}
+    pub fn storage_remove(_: &str) {}
+}
+
+fn valid_username(name: &str) -> bool {
+    (3..=16).contains(&name.len())
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+}
+
+fn valid_password(password: &str) -> bool {
+    (8..=64).contains(&password.chars().count()) && !password.chars().any(char::is_control)
+}
+
+fn auth_error(code: &str) -> &'static str {
+    match code {
+        "bad_username" => "Kullanıcı adı 3–16 harf, rakam, _ veya - içermeli.",
+        "bad_password" => "Şifre 8–64 karakter olmalı; kontrol karakteri içermemeli.",
+        "taken" => "Bu kullanıcı adı zaten alınmış. Başka bir ad seçin.",
+        "wrong" => "Kullanıcı adı veya şifre hatalı.",
+        "online" => "Bu hesap başka bir pencerede açık. Önce oradan çıkış yapın.",
+        "rate_limited" => "Çok fazla deneme yaptınız. Biraz bekleyip yeniden deneyin.",
+        "expired" => "Oturumunuz sona erdi. Lütfen yeniden giriş yapın.",
+        "full" => "Sunucu şu anda dolu veya işlem tamamlanamadı. Daha sonra deneyin.",
+        _ => "Giriş yapılamadı. Yeniden deneyin.",
+    }
+}
 
 fn websocket_url(
     protocol: &str,
@@ -76,6 +109,23 @@ mod tests {
         ] {
             assert!(websocket_url("https:", "example.org", path, false).is_err());
         }
+    }
+
+    #[test]
+    fn authentication_validation_accepts_pipes_and_rejects_controls() {
+        assert!(super::valid_username("User_123-abc"));
+        for name in ["ab", "bad name", "Türkçe", "abcdefghijklmnopq"] {
+            assert!(!super::valid_username(name));
+        }
+        assert!(super::valid_password("a|b|c|d|"));
+        assert!(super::valid_password(&"ş".repeat(64)));
+        assert!(!super::valid_password("short"));
+        assert!(!super::valid_password("password\n"));
+        assert!(!super::valid_password(&"a".repeat(65)));
+        assert_eq!(
+            super::auth_error("wrong"),
+            "Kullanıcı adı veya şifre hatalı."
+        );
     }
 }
 
@@ -229,13 +279,44 @@ const INDICES: [u16; 36] = [
 
 #[derive(Clone, Copy, PartialEq)]
 enum Screen {
-    Main,
-    Connecting,
+    Boot,
+    Auth,
+    Lobby,
+    Queue,
+    MatchIntro,
     Playing,
     Paused,
+    Settings,
     Dead,
     Result,
-    SettingsPaused,
+    RankedResult,
+    Disconnected,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Deathmatch,
+    Ranked,
+}
+#[derive(Clone, Copy, PartialEq)]
+enum Field {
+    Username,
+    Password,
+    Confirm,
+}
+struct Account {
+    name: String,
+    rating: u32,
+    wins: u32,
+    losses: u32,
+}
+struct RankedResult {
+    result: String,
+    reason: String,
+    old: u32,
+    rating: u32,
+    delta: i64,
+    at: f64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -254,8 +335,8 @@ impl Team {
 
     fn label(self) -> &'static str {
         match self {
-            Team::Boys => "Boys",
-            Team::Girls => "Girls",
+            Team::Boys => "Erkekler",
+            Team::Girls => "Kızlar",
         }
     }
 }
@@ -270,6 +351,8 @@ struct RemotePlayer {
     yaw: f32,
     health: u8,
     team: Team,
+    kills: u32,
+    deaths: u32,
 }
 
 struct BloodEffect {
@@ -338,7 +421,42 @@ struct Game {
     last_frame: f64,
     screen: Screen,
     map: Map,
-    nickname: String,
+    username: String,
+    password: String,
+    confirm: String,
+    register_tab: bool,
+    remember: bool,
+    show_password: bool,
+    field_error: Option<(Field, String)>,
+    touched: [bool; 3],
+    focus_auth: bool,
+    settings_back: Screen,
+    mode: Mode,
+    account: Option<Account>,
+    token: String,
+    auth_request: String,
+    pending: Option<(&'static str, f64)>,
+    online: u32,
+    dm_players: u32,
+    queued: u32,
+    top: Vec<(String, u32, u32, u32)>,
+    last_info: f64,
+    queue_since: f64,
+    opponent: Option<(String, u32)>,
+    go_at: f64,
+    ranked_ends_at: f64,
+    ranked_started: bool,
+    kill_target: u32,
+    ranked_result: Option<RankedResult>,
+    kill_feed: Vec<(String, String, Team, Team, f64)>,
+    hitmark_at: f64,
+    killed_by: Option<String>,
+    died_at: f64,
+    kills: u32,
+    deaths: u32,
+    toasts: Vec<(String, f64, bool)>,
+    crosshair: (usize, f32, usize),
+    confirm_leave: bool,
     status: String,
     sensitivity: f32,
     hud_scale: f32,
@@ -435,7 +553,7 @@ impl Game {
             })
             .collect();
 
-        unsafe {
+        let mut game = unsafe {
             let program = link_program(&gl, VERTEX_SHADER, FRAGMENT_SHADER);
             let sprite_program = link_program(&gl, SPRITE_VERTEX_SHADER, SPRITE_FRAGMENT_SHADER);
             let vao = vertex_array(&gl, &floats(&VERTICES), 0, &[(0, 3, 0)]);
@@ -491,9 +609,44 @@ impl Game {
                 jump: false,
                 vertical: 0.0,
                 last_frame: 0.0,
-                screen: Screen::Main,
+                screen: Screen::Auth,
                 map: Map::Camel,
-                nickname: String::new(),
+                username: web::storage_get("keles.username").unwrap_or_default(),
+                password: String::new(),
+                confirm: String::new(),
+                register_tab: false,
+                remember: true,
+                show_password: false,
+                field_error: None,
+                touched: [false; 3],
+                focus_auth: true,
+                settings_back: Screen::Lobby,
+                mode: Mode::Deathmatch,
+                account: None,
+                token: String::new(),
+                auth_request: String::new(),
+                pending: None,
+                online: 0,
+                dm_players: 0,
+                queued: 0,
+                top: Vec::new(),
+                last_info: f64::NEG_INFINITY,
+                queue_since: 0.0,
+                opponent: None,
+                go_at: 0.0,
+                ranked_ends_at: 0.0,
+                ranked_started: false,
+                kill_target: map::WIN_SCORE,
+                ranked_result: None,
+                kill_feed: Vec::new(),
+                hitmark_at: f64::NEG_INFINITY,
+                killed_by: None,
+                died_at: 0.0,
+                kills: 0,
+                deaths: 0,
+                toasts: Vec::new(),
+                crosshair: (0, 8.0, 0),
+                confirm_leave: false,
                 status: String::new(),
                 sensitivity: 50.0,
                 hud_scale: 200.0,
@@ -521,7 +674,13 @@ impl Game {
                 mouse_delta: Vec2::ZERO,
                 connect_deadline: 0.0,
             }
+        };
+        game.load_settings();
+        if let Some(token) = web::storage_get("keles.token") {
+            game.token = token;
+            game.screen = Screen::Boot;
         }
+        game
     }
 
     fn disconnect(&mut self) {
@@ -548,77 +707,108 @@ impl Game {
         self.jump = false;
         self.mouse_delta = Vec2::ZERO;
         #[cfg(target_arch = "wasm32")]
-        if !matches!(screen, Screen::Playing | Screen::Connecting) {
+        if !matches!(screen, Screen::Playing | Screen::MatchIntro)
+            && !(screen == Screen::Boot && self.grabbed)
+        {
             web::document().exit_pointer_lock();
         }
         match screen {
-            Screen::Playing | Screen::Main => self.status.clear(),
-            Screen::Dead => self.status = "Waiting to respawn.".to_owned(),
+            Screen::Playing | Screen::Lobby => self.status.clear(),
+            Screen::Dead => self.status = "Yeniden doğmayı bekliyorsun.".to_owned(),
             _ => {}
         }
     }
 
-    fn labels(&self) -> (&'static str, [&'static str; 3]) {
-        match self.screen {
-            Screen::Main | Screen::Connecting => ("", ["Oyuna gir", "", ""]),
-            Screen::Paused => ("Paused", ["Resume", "Settings", "Main menu"]),
-            Screen::Dead => ("You died", ["Respawn", "", ""]),
-            Screen::Result => (
-                match (self.team, self.winner) {
-                    (Some(team), Some(winner)) if team == winner => "Victory",
-                    _ => "Defeat",
-                },
-                ["", "", ""],
-            ),
-            Screen::SettingsPaused => ("Settings", ["Back", "", ""]),
-            Screen::Playing => ("", ["", "", ""]),
+    fn lock_pointer(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        web::canvas().request_pointer_lock();
+    }
+
+    fn request(&mut self, text: &'static str) {
+        if self.pending.is_none() {
+            self.send(text.to_owned());
+            self.pending = Some((text, self.last_frame + 10_000.0));
         }
     }
 
-    fn button(&mut self, index: usize) {
-        match (self.screen, index) {
-            (Screen::Main, 0) => {
-                if let Err(error) = self.connect() {
-                    self.status = error;
-                }
-            }
-            (Screen::Dead, 0) => {
-                #[cfg(target_arch = "wasm32")]
-                web::canvas().request_pointer_lock();
-                self.send("RESPAWN".to_owned());
-            }
-            _ => {
-                let next = match (self.screen, index) {
-                    (Screen::Paused, 0) if self.winner.is_some() => Screen::Result,
-                    (Screen::Paused, 0) if self.health == 0 => Screen::Dead,
-                    (Screen::Paused, 0) => {
-                        #[cfg(target_arch = "wasm32")]
-                        web::canvas().request_pointer_lock();
-                        Screen::Playing
-                    }
-                    (Screen::Paused, 1) => Screen::SettingsPaused,
-                    (Screen::Paused, 2) => {
-                        self.disconnect();
-                        Screen::Main
-                    }
-                    (Screen::SettingsPaused, 0) => Screen::Paused,
-                    _ => return,
-                };
-                self.show_screen(next);
-            }
+    fn lobby(&mut self) {
+        self.request("LOBBY");
+    }
+
+    fn logout(&mut self) {
+        self.send("LOGOUT".to_owned());
+        web::storage_remove("keles.token");
+        self.token.clear();
+        self.account = None;
+        self.pending = None;
+        self.disconnect();
+        self.show_screen(Screen::Auth);
+        self.focus_auth = true;
+    }
+
+    fn submit_auth(&mut self) {
+        self.touched = [true; 3];
+        self.field_error = self.validate_auth();
+        if self.field_error.is_some() || self.pending.is_some() {
+            return;
         }
+        let auth = format!(
+            "{}|{}|{}",
+            if self.register_tab {
+                "REGISTER"
+            } else {
+                "LOGIN"
+            },
+            self.username,
+            self.password
+        );
+        if let Err(error) = self.connect(auth, false) {
+            self.status = error;
+        }
+    }
+
+    fn validate_auth(&self) -> Option<(Field, String)> {
+        if self.touched[0] && !valid_username(&self.username) {
+            return Some((
+                Field::Username,
+                "3–16 harf, rakam, _ veya - kullanın.".to_owned(),
+            ));
+        }
+        if self.touched[1] && !valid_password(&self.password) {
+            return Some((
+                Field::Password,
+                "Şifreniz 8–64 karakter olmalı; kontrol karakteri içermemeli.".to_owned(),
+            ));
+        }
+        if self.register_tab && self.touched[2] && self.password != self.confirm {
+            return Some((Field::Confirm, "Şifreler eşleşmiyor.".to_owned()));
+        }
+        None
     }
 
     fn escape(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
         match self.screen {
-            Screen::Playing | Screen::Dead | Screen::Result => {
-                self.show_screen(Screen::Paused);
+            Screen::Playing => self.show_screen(Screen::Paused),
+            Screen::Paused => {
+                if self.confirm_leave {
+                    self.confirm_leave = false;
+                    return;
+                }
+                self.lock_pointer();
+                self.show_screen(if self.winner.is_some() {
+                    Screen::Result
+                } else if self.health == 0 {
+                    Screen::Dead
+                } else {
+                    Screen::Playing
+                });
             }
-            Screen::Connecting => {
-                self.disconnect();
-                self.show_screen(Screen::Main);
-            }
-            Screen::SettingsPaused => self.show_screen(Screen::Paused),
+            Screen::Queue => self.request("UNQUEUE"),
+            Screen::Settings => self.show_screen(self.settings_back),
+            Screen::MatchIntro | Screen::Dead | Screen::Result => self.show_screen(Screen::Paused),
             _ => {}
         }
     }
@@ -636,7 +826,7 @@ impl Game {
         if escape {
             self.escape();
         }
-        if self.screen != Screen::Playing {
+        if self.screen != Screen::Playing || (self.mode == Mode::Ranked && !self.ranked_started) {
             return;
         }
         if !self.grabbed {
@@ -662,39 +852,26 @@ impl Game {
         }
     }
 
-    fn server_url(&self) -> Result<String, String> {
-        let name = self.nickname.trim();
-        if name.is_empty()
-            || name.len() > 16
-            || !name
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-        {
-            return Err("Kullanıcı adı 1–16 harf, rakam, _ veya - içermeli.".to_owned());
-        }
+    fn connect(&mut self, auth: String, boot: bool) -> Result<(), String> {
         #[cfg(target_arch = "wasm32")]
-        return web::server_url();
+        let url = web::server_url()?;
         #[cfg(not(target_arch = "wasm32"))]
-        Err("The game client requires a browser.".to_owned())
-    }
-
-    fn connect(&mut self) -> Result<(), String> {
-        let url = self.server_url()?;
-        let socket = ewebsock::connect(url, Default::default())
-            .map_err(|_| "Bağlantı kurulamadı. Yeniden deneyin.")?;
+        let url = "ws://127.0.0.1:9001/keles".to_owned();
         self.disconnect();
-        self.map = Map::Camel;
-        self.yaw = -std::f32::consts::FRAC_PI_2;
-        self.pitch = 0.0;
-        self.vertical = 0.0;
-        self.socket = Some(socket);
-        self.last_sent = 0.0;
-        self.shot_at = f64::NEG_INFINITY;
+        self.account = None;
+        self.auth_request = auth;
+        self.socket = Some(
+            ewebsock::connect(url, Default::default())
+                .map_err(|_| "Bağlantı kurulamadı. Yeniden deneyin.")?,
+        );
         self.connect_deadline = self.last_frame + 10_000.0;
-        self.show_screen(Screen::Connecting);
-        self.status = "Bağlanılıyor…".to_owned();
-        #[cfg(target_arch = "wasm32")]
-        web::canvas().request_pointer_lock();
+        self.pending = Some(("AUTH", self.connect_deadline));
+        if boot {
+            self.show_screen(Screen::Boot);
+        } else {
+            self.show_screen(Screen::Auth);
+        }
+        self.status = "Giriş yapılıyor…".to_owned();
         Ok(())
     }
 
@@ -706,23 +883,252 @@ impl Game {
         {
             match event {
                 WsEvent::Opened => {
-                    let name = self.nickname.trim().to_owned();
-                    self.send(format!("JOIN|{name}"));
+                    let auth = std::mem::take(&mut self.auth_request);
+                    self.send(auth);
                 }
                 WsEvent::Message(WsMessage::Text(text)) => self.message(&text),
                 WsEvent::Message(_) => {}
                 WsEvent::Error(_) | WsEvent::Closed => {
+                    let logged_in = self.account.is_some();
+                    self.pending = None;
                     self.disconnect();
-                    self.show_screen(Screen::Main);
-                    self.status = "Bağlantı kapandı. Yeniden deneyin.".to_owned();
+                    self.show_screen(if logged_in {
+                        Screen::Disconnected
+                    } else {
+                        Screen::Auth
+                    });
+                    self.status = "Bağlantı kesildi. Yeniden bağlanabilirsiniz.".to_owned();
                 }
             }
+        }
+    }
+
+    fn clear_match(&mut self) {
+        self.remote.clear();
+        self.kill_feed.clear();
+        self.blood.clear();
+        self.kills = 0;
+        self.deaths = 0;
+        self.winner = None;
+        self.score = [0, 0];
+        self.team = None;
+        self.self_id = None;
+        self.connected = false;
+        self.killed_by = None;
+        self.shot_at = f64::NEG_INFINITY;
+        self.local_hit_at = f64::NEG_INFINITY;
+        self.yaw = -std::f32::consts::FRAC_PI_2;
+        self.pitch = 0.0;
+        if self.mode == Mode::Deathmatch {
+            self.kill_target = map::WIN_SCORE;
+        }
+    }
+
+    fn player_label(&self, id: u32) -> (String, Team) {
+        if self.self_id == Some(id) {
+            (self.username.clone(), self.team.unwrap_or(Team::Boys))
+        } else {
+            self.remote
+                .get(&id)
+                .map(|p| (p.name.clone(), p.team))
+                .unwrap_or(("Oyuncu".to_owned(), Team::Boys))
         }
     }
 
     fn message(&mut self, text: &str) {
         let mut parts = text.split('|');
         match parts.next() {
+            Some("AUTH_OK") => {
+                let fields: Vec<_> = parts.collect();
+                if fields.len() != 5 {
+                    return;
+                }
+                let (Ok(rating), Ok(wins), Ok(losses)) =
+                    (fields[2].parse(), fields[3].parse(), fields[4].parse())
+                else {
+                    return;
+                };
+                self.username = fields[0].to_owned();
+                self.token = fields[1].to_owned();
+                self.account = Some(Account {
+                    name: self.username.clone(),
+                    rating,
+                    wins,
+                    losses,
+                });
+                web::storage_set("keles.username", &self.username);
+                if self.remember {
+                    web::storage_set("keles.token", &self.token);
+                } else {
+                    web::storage_remove("keles.token");
+                }
+                self.password.clear();
+                self.confirm.clear();
+                self.pending = None;
+                self.field_error = None;
+                self.show_screen(Screen::Lobby);
+                self.send("INFO".to_owned());
+                self.last_info = self.last_frame;
+            }
+            Some("AUTH_ERR") => {
+                let code = parts.next().unwrap_or_default();
+                if matches!(code, "expired" | "online") {
+                    web::storage_remove("keles.token");
+                }
+                self.pending = None;
+                self.disconnect();
+                self.account = None;
+                self.show_screen(Screen::Auth);
+                self.focus_auth = true;
+                self.status = auth_error(code).to_owned();
+            }
+            Some("INFO") => {
+                let values: Vec<_> = parts.filter_map(|v| v.parse::<u32>().ok()).collect();
+                if values.len() != 6 {
+                    return;
+                }
+                self.online = values[0];
+                self.dm_players = values[1];
+                self.queued = values[2];
+                if let Some(a) = &mut self.account {
+                    a.rating = values[3];
+                    a.wins = values[4];
+                    a.losses = values[5];
+                }
+                if self.pending.is_some_and(|(action, _)| action == "LOBBY") {
+                    self.pending = None;
+                    self.clear_match();
+                    self.show_screen(Screen::Lobby);
+                }
+            }
+            Some("TOP") => {
+                self.top = parts
+                    .next()
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter_map(|row| {
+                        let fields: Vec<_> = row.split(':').collect();
+                        if fields.len() != 4 {
+                            return None;
+                        }
+                        Some((
+                            fields[0].to_owned(),
+                            fields[1].parse().ok()?,
+                            fields[2].parse().ok()?,
+                            fields[3].parse().ok()?,
+                        ))
+                    })
+                    .collect();
+            }
+            Some("QUEUED") => {
+                self.pending = None;
+                self.queue_since = self.last_frame;
+                self.show_screen(Screen::Queue);
+            }
+            Some("UNQUEUED") => {
+                self.pending = None;
+                self.show_screen(Screen::Lobby);
+            }
+            Some("MATCH") => {
+                let fields: Vec<_> = parts.collect();
+                if fields.len() != 6 {
+                    return;
+                }
+                let (Ok(opp), Ok(me), Ok(target), Ok(seconds), Ok(countdown)) = (
+                    fields[1].parse(),
+                    fields[2].parse(),
+                    fields[3].parse(),
+                    fields[4].parse::<f64>(),
+                    fields[5].parse::<f64>(),
+                ) else {
+                    return;
+                };
+                self.clear_match();
+                self.pending = None;
+                self.mode = Mode::Ranked;
+                self.ranked_started = false;
+                self.opponent = Some((fields[0].to_owned(), opp));
+                if let Some(a) = &mut self.account {
+                    a.rating = me;
+                }
+                self.kill_target = target;
+                self.go_at = self.last_frame + countdown * 1000.0;
+                self.ranked_ends_at = self.go_at + seconds * 1000.0;
+                self.show_screen(Screen::MatchIntro);
+            }
+            Some("GO") => {
+                self.ranked_started = true;
+                if self.screen == Screen::MatchIntro && self.grabbed {
+                    self.show_screen(Screen::Playing);
+                }
+            }
+            Some("RANKED_END") => {
+                let fields: Vec<_> = parts.collect();
+                if fields.len() != 6 {
+                    return;
+                }
+                let (Ok(rating), Ok(delta), Ok(wins), Ok(losses)) = (
+                    fields[2].parse(),
+                    fields[3].parse(),
+                    fields[4].parse(),
+                    fields[5].parse(),
+                ) else {
+                    return;
+                };
+                let old = self.account.as_ref().map_or(rating, |a| a.rating);
+                if let Some(a) = &mut self.account {
+                    a.rating = rating;
+                    a.wins = wins;
+                    a.losses = losses;
+                }
+                self.ranked_result = Some(RankedResult {
+                    result: fields[0].to_owned(),
+                    reason: fields[1].to_owned(),
+                    old,
+                    rating,
+                    delta,
+                    at: self.last_frame,
+                });
+                self.pending = None;
+                self.connected = false;
+                self.ranked_started = false;
+                self.show_screen(Screen::RankedResult);
+                self.send("INFO".to_owned());
+            }
+            Some("HITMARK") => {
+                self.hitmark_at = self.last_frame;
+            }
+            Some("KILL") => {
+                let (Some(Ok(killer)), Some(Ok(victim))) = (
+                    parts.next().map(str::parse::<u32>),
+                    parts.next().map(str::parse::<u32>),
+                ) else {
+                    return;
+                };
+                let (killer_name, killer_team) = self.player_label(killer);
+                let (victim_name, victim_team) = self.player_label(victim);
+                if self.self_id == Some(killer) {
+                    self.kills += 1;
+                } else if let Some(p) = self.remote.get_mut(&killer) {
+                    p.kills += 1;
+                }
+                if self.self_id == Some(victim) {
+                    self.deaths += 1;
+                    self.killed_by = Some(killer_name.clone());
+                } else if let Some(p) = self.remote.get_mut(&victim) {
+                    p.deaths += 1;
+                }
+                if self.kill_feed.len() == 5 {
+                    self.kill_feed.remove(0);
+                }
+                self.kill_feed.push((
+                    killer_name,
+                    victim_name,
+                    killer_team,
+                    victim_team,
+                    self.last_frame,
+                ));
+            }
             Some("WELCOME") => {
                 if let (Some(id), Some(x), Some(z), Some(y), Some(health), Some(team)) = (
                     parts.next(),
@@ -750,11 +1156,16 @@ impl Game {
                         } else {
                             Team::Boys
                         });
-                        self.show_screen(if self.grabbed {
-                            Screen::Playing
+                        self.pending = None;
+                        if self.mode == Mode::Ranked {
+                            self.show_screen(Screen::MatchIntro);
                         } else {
-                            Screen::Paused
-                        });
+                            self.show_screen(if self.grabbed {
+                                Screen::Playing
+                            } else {
+                                Screen::Paused
+                            });
+                        }
                     }
                 }
             }
@@ -763,6 +1174,14 @@ impl Game {
                     parts.next().map(str::parse::<u32>),
                     parts.next().map(str::parse::<u32>),
                 ) {
+                    if self.mode == Mode::Deathmatch && boys == 0 && girls == 0 {
+                        self.kills = 0;
+                        self.deaths = 0;
+                        for p in self.remote.values_mut() {
+                            p.kills = 0;
+                            p.deaths = 0;
+                        }
+                    }
                     self.score = [boys, girls];
                 }
             }
@@ -789,12 +1208,15 @@ impl Game {
                         self.position = Vec3::new(x, y + map::EYE_HEIGHT, z);
                         self.ground = self.position;
                         self.vertical = 0.0;
+                        if self.pending.is_some_and(|(action, _)| action == "RESPAWN") {
+                            self.pending = None;
+                        }
                         self.shot_at = f64::NEG_INFINITY;
                         // AT also starts a new round, so a past win must not block
                         // the death screen.
                         self.winner = None;
                         // Leave an open pause or settings menu alone.
-                        if !matches!(self.screen, Screen::Paused | Screen::SettingsPaused) {
+                        if !matches!(self.screen, Screen::Paused | Screen::Settings) {
                             self.show_screen(if self.grabbed {
                                 Screen::Playing
                             } else {
@@ -845,6 +1267,8 @@ impl Game {
                             target: Vec3::new(x, y, z),
                             yaw,
                             health,
+                            kills: parts.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+                            deaths: parts.next().and_then(|v| v.parse().ok()).unwrap_or(0),
                             team: if team == "girls" {
                                 Team::Girls
                             } else {
@@ -912,6 +1336,7 @@ impl Game {
                         }
                         self.health = health;
                         if health == 0 && self.winner.is_none() {
+                            self.died_at = self.last_frame;
                             self.show_screen(Screen::Dead);
                         }
                     } else if let Some(player) = self.remote.get_mut(&id) {
@@ -935,24 +1360,11 @@ impl Game {
                 }
             }
             Some("ERROR") => {
-                let reason = parts
-                    .next()
-                    .unwrap_or("Server rejected connection")
-                    .to_owned();
-                self.disconnect();
-                self.show_screen(Screen::Main);
-                self.status = match reason.as_str() {
-                    "Nickname already in use" => {
-                        "Bu kullanıcı adı kullanımda. Başka bir ad deneyin."
-                    }
-                    "Server is full" => "Sunucu dolu. Biraz sonra yeniden deneyin.",
-                    "Invalid nickname" => "Kullanıcı adı 1–16 harf, rakam, _ veya - içermeli.",
-                    "Too many players from your address" => {
-                        "Bu bağlantıdan oyuncu sınırına ulaşıldı."
-                    }
-                    _ => "Bağlantı reddedildi. Yeniden deneyin.",
-                }
-                .to_owned();
+                self.pending = None;
+                self.status = "Odaya girilemedi. Oda dolu olabilir; yeniden deneyin.".to_owned();
+                self.toasts
+                    .push((self.status.clone(), self.last_frame, true));
+                self.show_screen(Screen::Lobby);
             }
             _ => {}
         }
@@ -968,7 +1380,7 @@ impl Game {
             let eased = Vec3::new(player.x, player.y, player.z).lerp(player.target, blend);
             (player.x, player.y, player.z) = (eased.x, eased.y, eased.z);
         }
-        if matches!(self.screen, Screen::Main | Screen::Connecting) {
+        if matches!(self.screen, Screen::Auth | Screen::Boot) {
             return false;
         }
         let forward = Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin());
@@ -1298,6 +1710,7 @@ impl Game {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui) {
+        let before = self.settings_values();
         egui::Frame::new()
             .fill(Color32::from_rgba_unmultiplied(30, 9, 5, 235))
             .stroke(Stroke::new(1.0, Color32::from_rgb(0x7a, 0x24, 0x12)))
@@ -1307,30 +1720,28 @@ impl Game {
                     ui.set_width(296.0);
                     ui.spacing_mut().slider_width = 296.0;
                     ui.style_mut().override_font_id = Some(FontId::proportional(18.0));
-                    ui.label(format!("Sensitivity: {}%", self.sensitivity));
+                    ui.label(format!("Hassasiyet: {}%", self.sensitivity));
                     ui.add(
                         egui::Slider::new(&mut self.sensitivity, 0.0..=200.0)
                             .step_by(1.0)
                             .show_value(false)
                             .trailing_fill(true),
                     );
-                    ui.label(format!("HUD scale: {}%", self.hud_scale));
+                    ui.label(format!("Arayüz ölçeği: {}%", self.hud_scale));
                     ui.add(
                         egui::Slider::new(&mut self.hud_scale, 50.0..=200.0)
                             .step_by(10.0)
                             .show_value(false)
                             .trailing_fill(true),
                     );
-                    ui.checkbox(&mut self.show_fps, "Show FPS");
-                    if ui
-                        .checkbox(&mut self.show_blood, "Show blood effects")
-                        .changed()
+                    ui.checkbox(&mut self.show_fps, "FPS göster");
+                    if ui.checkbox(&mut self.show_blood, "Kan efektleri").changed()
                         && !self.show_blood
                     {
                         self.blood.clear();
                         self.local_hit_at = f64::NEG_INFINITY;
                     }
-                    let display = ui.checkbox(&mut self.fullscreen, "Fullscreen").changed();
+                    let display = ui.checkbox(&mut self.fullscreen, "Tam ekran").changed();
                     let monitor = ui.ctx().input(|i| i.viewport().monitor_size).map(|size| {
                         size * ui
                             .ctx()
@@ -1338,9 +1749,9 @@ impl Game {
                     });
                     let name = |resolution: Option<[u32; 2]>| match resolution {
                         Some([width, height]) => format!("{width} × {height}"),
-                        None => "Native".to_owned(),
+                        None => "Ekrana uyarla".to_owned(),
                     };
-                    ui.label("Resolution");
+                    ui.label("Çözünürlük");
                     egui::ComboBox::from_id_salt("resolution")
                         .selected_text(name(self.resolution))
                         .width(296.0)
@@ -1365,10 +1776,10 @@ impl Game {
                             }
                         });
                     let limit = |fps: u32| match fps {
-                        0 => "Unlimited".to_owned(),
+                        0 => "Sınırsız".to_owned(),
                         fps => format!("{fps} FPS"),
                     };
-                    ui.label("FPS limit");
+                    ui.label("FPS sınırı");
                     egui::ComboBox::from_id_salt("fps-limit")
                         .selected_text(limit(self.fps_limit))
                         .width(296.0)
@@ -1382,6 +1793,9 @@ impl Game {
                     }
                 })
             });
+        if before != self.settings_values() {
+            self.save_settings();
+        }
     }
 
     fn apply_display(&mut self) {
@@ -1395,96 +1809,321 @@ impl Game {
         }
     }
 
+    fn settings_values(&self) -> [String; 7] {
+        [
+            self.sensitivity.to_string(),
+            self.hud_scale.to_string(),
+            self.show_fps.to_string(),
+            self.show_blood.to_string(),
+            self.resolution
+                .map(|[w, h]| format!("{w},{h}"))
+                .unwrap_or_default(),
+            self.fps_limit.to_string(),
+            format!(
+                "{},{},{}",
+                self.crosshair.0, self.crosshair.1, self.crosshair.2
+            ),
+        ]
+    }
+
+    fn save_settings(&self) {
+        for (key, value) in [
+            "sensitivity",
+            "hud_scale",
+            "show_fps",
+            "show_blood",
+            "resolution",
+            "fps_limit",
+            "crosshair",
+        ]
+        .into_iter()
+        .zip(self.settings_values())
+        {
+            web::storage_set(&format!("keles.{key}"), &value);
+        }
+    }
+
+    fn load_settings(&mut self) {
+        let number = |key: &str| {
+            web::storage_get(&format!("keles.{key}"))
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|v| v.is_finite())
+        };
+        if let Some(v) = number("sensitivity") {
+            self.sensitivity = v.clamp(0.0, 200.0);
+        }
+        if let Some(v) = number("hud_scale") {
+            self.hud_scale = v.clamp(50.0, 200.0);
+        }
+        if let Some(v) = web::storage_get("keles.show_fps").and_then(|v| v.parse().ok()) {
+            self.show_fps = v;
+        }
+        if let Some(v) = web::storage_get("keles.show_blood").and_then(|v| v.parse().ok()) {
+            self.show_blood = v;
+        }
+        if let Some(v) = web::storage_get("keles.fps_limit")
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| FPS_LIMITS.contains(v))
+        {
+            self.fps_limit = v;
+        }
+        if let Some(v) = web::storage_get("keles.resolution") {
+            if let Some((w, h)) = v.split_once(',') {
+                if let (Ok(w), Ok(h)) = (w.parse(), h.parse()) {
+                    if RESOLUTIONS.contains(&[w, h]) {
+                        self.resolution = Some([w, h]);
+                    }
+                }
+            }
+        }
+        if let Some(v) = web::storage_get("keles.crosshair") {
+            let fields: Vec<_> = v.split(',').collect();
+            if fields.len() == 3 {
+                if let (Ok(style), Ok(size), Ok(color)) = (
+                    fields[0].parse::<usize>(),
+                    fields[1].parse::<f32>(),
+                    fields[2].parse::<usize>(),
+                ) {
+                    if style < 3 && size.is_finite() && (3.0..=20.0).contains(&size) && color < 5 {
+                        self.crosshair = (style, size, color);
+                    }
+                }
+            }
+        }
+    }
+
     fn menu(&mut self, ctx: &egui::Context) {
         if self.screen == Screen::Playing {
             return;
         }
-        let screen = ctx.viewport_rect();
-        // Radial crimson glow behind the menu, like the logo's backdrop.
-        let center = pos2(screen.center().x, screen.top() + screen.height() * 0.38);
-        let inner = Color32::from_rgba_unmultiplied(130, 24, 6, 153);
-        let outer = Color32::from_rgba_unmultiplied(8, 3, 2, 242);
-        let mut mesh = egui::Mesh::default();
-        mesh.colored_vertex(center, inner);
-        for step in 0..=64 {
-            let angle = step as f32 * std::f32::consts::TAU / 64.0;
-            let direction = vec2(angle.cos(), angle.sin()) * screen.size();
-            mesh.colored_vertex(center + direction * 0.72, outer);
-            mesh.colored_vertex(center + direction * 3.0, outer);
-            if step > 0 {
-                let [a, b, c, d] = [step * 2 - 1, step * 2, step * 2 + 1, step * 2 + 2];
-                mesh.add_triangle(0, a, c);
-                mesh.add_triangle(a, b, d);
-                mesh.add_triangle(a, d, c);
-            }
-        }
-        ctx.layer_painter(LayerId::new(Order::Background, Id::new("backdrop")))
-            .add(mesh);
-
-        let (title, labels) = self.labels();
-        let mut clicked = None;
         egui::Area::new(Id::new("menu"))
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                let size = self.logo.size_vec2();
-                let logo = size
-                    * (screen.width() * 0.92 / size.x)
-                        .min(screen.height() * 0.58 / size.y)
-                        .min(1.0);
-                ui.set_width(
-                    if matches!(self.screen, Screen::Main | Screen::Connecting) {
-                        logo.x.max(520.0)
-                    } else {
-                        520.0
-                    },
-                );
-                ui.vertical_centered(|ui| {
-                    ui.spacing_mut().item_spacing.y = 14.0;
-                    if matches!(self.screen, Screen::Main | Screen::Connecting) {
-                        ui.image((self.logo.id(), logo));
-                    }
-                    if !title.is_empty() {
-                        ui.label(
-                            RichText::new(title.to_uppercase())
-                                .size(46.0)
-                                .strong()
-                                .color(TITLE),
-                        );
-                    }
-                    if matches!(self.screen, Screen::Main | Screen::Connecting) {
-                        ui.add_enabled(
-                            self.screen == Screen::Main,
-                            egui::TextEdit::singleline(&mut self.nickname)
-                                .hint_text("Kullanıcı adı")
-                                .char_limit(16)
-                                .font(FontId::proportional(18.0))
-                                .margin(vec2(18.0, 12.0))
-                                .desired_width(340.0),
-                        );
-                    }
-                    if !self.status.is_empty() {
-                        ui.set_max_width(340.0);
-                        ui.label(RichText::new(&self.status).size(16.0).color(STATUS));
-                    }
-                    if self.screen == Screen::SettingsPaused {
-                        self.settings(ui);
-                    }
-                    for (index, label) in labels.into_iter().enumerate() {
-                        if label.is_empty() {
-                            continue;
-                        }
-                        let button = egui::Button::new(RichText::new(label).size(20.0).strong())
-                            .min_size(vec2(340.0, 50.0));
-                        let enabled = self.screen != Screen::Connecting;
-                        if ui.add_enabled(enabled, button).clicked() {
-                            clicked = Some(index);
-                        }
-                    }
-                });
+                egui::Frame::new()
+                    .fill(Color32::from_black_alpha(230))
+                    .inner_margin(24)
+                    .show(ui, |ui| {
+                        ui.set_width(420.0);
+                        ui.vertical_centered(|ui| {
+                            match self.screen {
+                                Screen::Boot => {
+                                    ui.label("Giriş yapılıyor…");
+                                    if ui.button("Geri").clicked() {
+                                        self.logout();
+                                    }
+                                }
+                                Screen::Auth => {
+                                    ui.horizontal(|ui| {
+                                        ui.selectable_value(
+                                            &mut self.register_tab,
+                                            false,
+                                            "Giriş Yap",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.register_tab,
+                                            true,
+                                            "Kayıt Ol",
+                                        );
+                                    });
+                                    ui.add_enabled_ui(self.pending.is_none(), |ui| {
+                                        ui.label("Kullanıcı adı");
+                                        ui.text_edit_singleline(&mut self.username);
+                                        ui.label("Şifre");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.password)
+                                                .password(true),
+                                        );
+                                        if self.register_tab {
+                                            ui.label("Şifre tekrar");
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut self.confirm)
+                                                    .password(true),
+                                            );
+                                        }
+                                        ui.checkbox(&mut self.remember, "Beni hatırla");
+                                        if ui
+                                            .button(if self.register_tab {
+                                                "Kayıt ol"
+                                            } else {
+                                                "Giriş yap"
+                                            })
+                                            .clicked()
+                                            || ui.input(|i| i.key_pressed(Key::Enter))
+                                        {
+                                            self.submit_auth();
+                                        }
+                                    });
+                                    if let Some((_, error)) = &self.field_error {
+                                        ui.label(error);
+                                    }
+                                }
+                                Screen::Lobby => {
+                                    ui.heading(format!("Hoş geldin, {}", self.username));
+                                    ui.label(format!(
+                                        "{} çevrimiçi · {}/16 odada",
+                                        self.online, self.dm_players
+                                    ));
+                                    if ui
+                                        .add_enabled(
+                                            self.pending.is_none(),
+                                            egui::Button::new("Takım Ölüm Maçı · Oyna"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.mode = Mode::Deathmatch;
+                                        self.clear_match();
+                                        self.lock_pointer();
+                                        self.request("PLAY");
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            self.pending.is_none(),
+                                            egui::Button::new("Dereceli maç bul"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.request("QUEUE");
+                                    }
+                                    if ui.button("Ayarlar").clicked() {
+                                        self.settings_back = Screen::Lobby;
+                                        self.show_screen(Screen::Settings);
+                                    }
+                                    if ui.button("Çıkış yap").clicked() {
+                                        self.logout();
+                                    }
+                                }
+                                Screen::Queue => {
+                                    ui.heading("Rakip aranıyor…");
+                                    ui.label(format!(
+                                        "{} saniye",
+                                        ((self.last_frame - self.queue_since) / 1000.0) as u32
+                                    ));
+                                    if ui.button("İptal (Esc)").clicked() {
+                                        self.request("UNQUEUE");
+                                    }
+                                }
+                                Screen::MatchIntro => {
+                                    ui.heading(format!(
+                                        "{} — {}",
+                                        self.username,
+                                        self.opponent
+                                            .as_ref()
+                                            .map(|o| o.0.as_str())
+                                            .unwrap_or("Rakip")
+                                    ));
+                                    ui.label(format!(
+                                        "{:.0}",
+                                        ((self.go_at - self.last_frame) / 1000.0).ceil().max(0.0)
+                                    ));
+                                    if ui.button("Başlamak için tıkla").clicked() {
+                                        self.lock_pointer();
+                                    }
+                                    if ui.button("Lobiye dön").clicked() {
+                                        self.lobby();
+                                    }
+                                }
+                                Screen::Paused => {
+                                    ui.heading("Duraklatıldı");
+                                    if ui.button("Devam et").clicked() {
+                                        self.escape();
+                                    }
+                                    if ui.button("Ayarlar").clicked() {
+                                        self.settings_back = Screen::Paused;
+                                        self.show_screen(Screen::Settings);
+                                    }
+                                    if self.confirm_leave {
+                                        ui.label("Ayrılmak mağlubiyet sayılır");
+                                        if ui.button("Ayrılmayı onayla").clicked() {
+                                            self.confirm_leave = false;
+                                            self.lobby();
+                                        }
+                                    } else if ui.button("Maçtan ayrıl").clicked() {
+                                        if self.mode == Mode::Ranked && self.ranked_started {
+                                            self.confirm_leave = true;
+                                        } else {
+                                            self.lobby();
+                                        }
+                                    }
+                                }
+                                Screen::Settings => {
+                                    self.settings(ui);
+                                    if ui.button("Geri").clicked() {
+                                        self.show_screen(self.settings_back);
+                                    }
+                                }
+                                Screen::Dead => {
+                                    ui.heading("Öldün");
+                                    ui.label(format!(
+                                        "Seni öldürdü: {}",
+                                        self.killed_by.as_deref().unwrap_or("Rakip")
+                                    ));
+                                    if self.mode == Mode::Ranked {
+                                        ui.label(format!(
+                                            "Yeniden doğuş: {:.0}",
+                                            ((self.died_at + 2000.0 - self.last_frame) / 1000.0)
+                                                .ceil()
+                                                .max(0.0)
+                                        ));
+                                    } else if ui.button("Yeniden doğ").clicked() {
+                                        self.lock_pointer();
+                                        self.request("RESPAWN");
+                                    }
+                                    if ui.button("Lobiye dön").clicked() {
+                                        self.lobby();
+                                    }
+                                }
+                                Screen::Result => {
+                                    ui.heading(if self.team == self.winner {
+                                        "ZAFER"
+                                    } else {
+                                        "YENİLGİ"
+                                    });
+                                    ui.label(format!("{} — {}", self.score[0], self.score[1]));
+                                    if ui.button("Lobiye dön").clicked() {
+                                        self.lobby();
+                                    }
+                                }
+                                Screen::RankedResult => {
+                                    if let Some(r) = &self.ranked_result {
+                                        ui.heading(match r.result.as_str() {
+                                            "win" => "ZAFER",
+                                            "loss" => "YENİLGİ",
+                                            _ => "BERABERE",
+                                        });
+                                        ui.label(format!("{} ({:+})", r.rating, r.delta));
+                                    }
+                                    if ui.button("Tekrar sıraya gir").clicked() {
+                                        self.request("QUEUE");
+                                    }
+                                    if ui.button("Lobiye dön").clicked() {
+                                        self.show_screen(Screen::Lobby);
+                                        self.send("INFO".to_owned());
+                                    }
+                                }
+                                Screen::Disconnected => {
+                                    ui.heading("Bağlantı kesildi");
+                                    if ui.button("Yeniden bağlan").clicked() {
+                                        if self.token.is_empty() {
+                                            self.show_screen(Screen::Auth);
+                                        } else if let Err(e) =
+                                            self.connect(format!("TOKEN|{}", self.token), true)
+                                        {
+                                            self.status = e;
+                                        }
+                                    }
+                                    if ui.button("Çıkış").clicked() {
+                                        self.logout();
+                                    }
+                                }
+                                Screen::Playing => {}
+                            }
+                            if self.pending.is_some() {
+                                ui.spinner();
+                            }
+                            ui.label(&self.status);
+                        });
+                    });
             });
-        if let Some(index) = clicked {
-            self.button(index);
-        }
     }
 
     fn hud(&self, ctx: &egui::Context) {
@@ -1504,7 +2143,7 @@ impl Game {
         };
         let in_match = matches!(
             self.screen,
-            Screen::Playing | Screen::Paused | Screen::SettingsPaused
+            Screen::Playing | Screen::Paused | Screen::Settings
         );
         if self.socket.is_some() && (in_match || self.screen == Screen::Dead) {
             let mut names = self
@@ -1514,15 +2153,15 @@ impl Game {
                 .collect::<Vec<_>>();
             names.sort_unstable();
             let status = if !self.connected {
-                "Connecting...".to_owned()
+                "Bağlanılıyor…".to_owned()
             } else if self.health == 0 {
-                "You are dead\nPress Respawn".to_owned()
+                "Öldün\nYeniden doğ düğmesine tıkla".to_owned()
             } else {
                 format!(
-                    "You: {}\nOthers: {}",
-                    self.nickname.trim(),
+                    "Sen: {}\nDiğerleri: {}",
+                    self.username.trim(),
                     if names.is_empty() {
-                        "none".to_owned()
+                        "yok".to_owned()
                     } else {
                         names.join(", ")
                     }
@@ -1556,7 +2195,7 @@ impl Game {
             fill.set_width(bar.width() * self.health as f32 / 3.0);
             painter.rect_filled(fill, 0.0, Color32::from_rgb(0xff, 0x6a, 0x22));
             painter.rect_stroke(bar, 0.0, Stroke::new(1.0, CRIMSON), StrokeKind::Outside);
-            let label = format!("Health {}/3", self.health);
+            let label = format!("Can {}/3", self.health);
             text(
                 bar.left_top() - vec2(0.0, 5.0 * scale),
                 Align2::LEFT_BOTTOM,
@@ -1578,7 +2217,7 @@ impl Game {
                 (105.0, Team::Girls, self.score[1]),
             ] {
                 let you = if self.team == Some(team) {
-                    " · YOU"
+                    " · SEN"
                 } else {
                     ""
                 };
@@ -1602,7 +2241,7 @@ impl Game {
             text(
                 center + vec2(0.0, -12.0),
                 Align2::CENTER_CENTER,
-                "TEAM KILL",
+                "HEDEF",
                 11.0,
                 gray,
             );
@@ -1632,11 +2271,42 @@ impl eframe::App for Game {
             self.fps_frames = 0;
         }
         self.fps_frames += 1;
+        // Start after WebRunner initialization, which can outlast the server's auth deadline.
+        if self.screen == Screen::Boot && self.socket.is_none() && self.pending.is_none() {
+            self.last_frame = now;
+            if let Err(error) = self.connect(format!("TOKEN|{}", self.token), true) {
+                self.status = error;
+                self.show_screen(Screen::Auth);
+            }
+        }
         self.poll_socket();
-        if self.screen == Screen::Connecting && now >= self.connect_deadline {
+        if self.pending.is_some_and(|(_, deadline)| now >= deadline) {
+            self.pending = None;
+            self.status = "İşlem zaman aşımına uğradı. Yeniden deneyin.".to_owned();
+            self.toasts.push((self.status.clone(), now, true));
             self.disconnect();
-            self.show_screen(Screen::Main);
-            self.status = "Sunucuya ulaşılamadı. Yeniden deneyin.".to_owned();
+            self.show_screen(if self.account.is_some() {
+                Screen::Disconnected
+            } else {
+                Screen::Auth
+            });
+        }
+        if matches!(self.screen, Screen::Lobby | Screen::Queue) && now - self.last_info >= 5000.0 {
+            self.send("INFO".to_owned());
+            self.last_info = now;
+        }
+        if self.screen == Screen::MatchIntro && self.ranked_started && self.grabbed {
+            self.show_screen(Screen::Playing);
+        }
+        if self.mode == Mode::Ranked
+            && self.health == 0
+            && self.connected
+            && self.winner.is_none()
+            && matches!(self.screen, Screen::Dead | Screen::Paused)
+            && now - self.died_at >= 2000.0
+            && self.pending.is_none()
+        {
+            self.request("RESPAWN");
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -1646,7 +2316,7 @@ impl eframe::App for Game {
         self.input(&ctx);
         if self.screen == Screen::Result {
             let remaining = ((self.result_deadline - now) / 1000.0).ceil().max(0.0) as u32;
-            self.status = format!("Restarting in {remaining}");
+            self.status = format!("Yeniden başlıyor: {remaining}");
         }
 
         let screen = ctx.viewport_rect();

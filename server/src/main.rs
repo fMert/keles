@@ -486,9 +486,9 @@ fn finish_ranked(world: &mut World, match_id: u32, winner: Option<u32>, reason: 
         };
         let a = updated.get_mut(&keys[i]).unwrap();
         a.rating = accounts::elo(old[i], old[1 - i], score);
-        // shortcut: the six-field format cannot count draws; draw-only accounts enter TOP after a decisive game.
-        a.wins += u32::from(score > 0.5);
-        a.losses += u32::from(score < 0.5);
+        // Owner decision: count draws in both columns so draw-only accounts enter TOP.
+        a.wins += u32::from(score >= 0.5);
+        a.losses += u32::from(score <= 0.5);
     }
     if reason != "cancelled" {
         if let Err(error) = accounts::save(&world.data_path, &updated) {
@@ -1375,6 +1375,21 @@ mod tests {
         first_thread.join().unwrap();
         second_thread.join().unwrap();
 
+        let (mut login, login_thread) = connect();
+        login
+            .send(Message::Text("LOGIN|First|password1".into()))
+            .unwrap();
+        let auth = read(&mut login, "AUTH_OK|");
+        let token = auth.split('|').nth(2).unwrap();
+        login.send(Message::Text("LOGOUT".into())).unwrap();
+        login_thread.join().unwrap();
+        let (mut expired, expired_thread) = connect();
+        expired
+            .send(Message::Text(format!("TOKEN|{token}").into()))
+            .unwrap();
+        assert_eq!(read(&mut expired, "AUTH_ERR|"), "AUTH_ERR|expired");
+        expired_thread.join().unwrap();
+
         {
             let mut world = shared.lock().unwrap();
             let (outgoing, _incoming) = mpsc::sync_channel(1);
@@ -1406,6 +1421,7 @@ mod tests {
             .unwrap();
         assert_eq!(read(&mut full, "AUTH_ERR|"), "AUTH_ERR|full");
         full_thread.join().unwrap();
+        std::fs::remove_file(&shared.lock().unwrap().data_path).unwrap();
     }
 
     #[test]

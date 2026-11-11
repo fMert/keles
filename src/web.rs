@@ -5,6 +5,26 @@ pub fn document() -> web_sys::Document {
     web_sys::window().unwrap().document().unwrap()
 }
 
+pub fn storage_get(key: &str) -> Option<String> {
+    web_sys::window()?
+        .local_storage()
+        .ok()??
+        .get_item(key)
+        .ok()?
+}
+
+pub fn storage_set(key: &str, value: &str) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(key, value);
+    }
+}
+
+pub fn storage_remove(key: &str) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.remove_item(key);
+    }
+}
+
 pub fn canvas() -> web_sys::HtmlCanvasElement {
     document()
         .get_element_by_id("keles")
@@ -103,7 +123,7 @@ async fn start_game(runner: &eframe::WebRunner) -> Result<(), JsValue> {
     runner.add_event_listener(&document(), "pointerlockerror", |_: web_sys::Event, app| {
         let game = app.app_mut::<Game>();
         pause(game);
-        game.status = "Fare kilitlenemedi. Devam etmek için Resume düğmesine tıklayın.".to_owned();
+        game.status = "Fare kilitlenemedi. Devam et düğmesine tıklayın.".to_owned();
     })?;
     runner.add_event_listener(
         &web_sys::window().unwrap(),
