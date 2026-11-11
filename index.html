@@ -4,18 +4,30 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="keles-websocket-path" content="/keles">
+  <meta name="description" content="Keles: tarayıcıda hafif çok oyunculu FPS. Takım Ölüm Maçı ve dereceli 1v1 mücadeleleri.">
+  <meta name="theme-color" content="#0E0605">
+  <meta property="og:title" content="Keles — Takım Ölüm Maçı ve Dereceli 1v1">
+  <meta property="og:description" content="Hesabını oluştur, takımına katıl veya dereceli 1v1 maçlarda ligini yükselt.">
+  <meta property="og:image" content="logo.png">
+  <link rel="icon" type="image/png" href="logo.png">
   <title>Keles</title>
   <link data-trunk rel="rust" data-wasm-opt="s" data-wasm-opt-params="--enable-bulk-memory --enable-bulk-memory-opt --enable-nontrapping-float-to-int --enable-sign-ext">
   <link data-trunk rel="copy-file" href="LICENSE">
   <link data-trunk rel="copy-file" href="THIRD-PARTY-LICENSES.txt">
   <link data-trunk rel="copy-file" href="assets/DejaVu-LICENSE.txt">
+  <link data-trunk rel="copy-file" href="assets/logo.png">
   <link data-trunk rel="copy-file" href="LICENSE-MIT-WebGL2Samples">
   <link data-trunk rel="copy-file" href="LICENSE-MIT-wasm-bindgen">
   <link data-trunk rel="copy-file" href="LICENSE-MIT-egui">
   <style>
-    html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #140704; color: #ffe6da; font-family: sans-serif; }
+    html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #0e0605; color: #ffe6da; font-family: sans-serif; }
     canvas { display: block; width: 100%; height: 100%; outline: none; }
-    #loading { position: fixed; inset: 0; display: grid; place-content: center; text-align: center; pointer-events: none; }
+    #loading { position: fixed; inset: 0; display: grid; justify-items: center; place-content: center; gap: 24px; padding: 24px; text-align: center; pointer-events: none; background: radial-gradient(ellipse at center, #2a100a, #0e0605 70%); }
+    #loading img { width: min(360px, 70vw); max-height: 40vh; object-fit: contain; }
+    .progress { width: min(280px, 65vw); height: 3px; border-radius: 8px; overflow: hidden; background: #5a1d10; }
+    .progress::after { content: ""; display: block; width: 35%; height: 100%; background: #ff4a1c; animation: progress 1.4s ease-in-out infinite alternate; }
+    @keyframes progress { from { transform: translateX(-100%); } to { transform: translateX(290%); } }
+    @media (prefers-reduced-motion: reduce) { .progress::after { animation: none; width: 100%; } }
     #loading a { color: #ff7a2c; pointer-events: auto; }
     .load-error { opacity: 0; animation: reveal 0s 20s forwards; }
     @keyframes reveal { to { opacity: 1; } }
@@ -23,6 +35,6 @@
 </head>
 <body>
   <canvas id="keles" aria-label="Keles oyunu"></canvas>
-  <div id="loading" role="status">Keles yükleniyor…<span class="load-error">Yüklenmediyse <a href="">yeniden deneyin</a>.</span><noscript>Oyun için WebAssembly ve JavaScript etkin olmalı.</noscript></div>
+  <div id="loading" role="status"><img src="logo.png" alt="Keles"><div class="progress" aria-hidden="true"></div><span>Keles yükleniyor…</span><span class="load-error">Yüklenmediyse <a href="">yeniden deneyin</a>.</span><noscript>Oyun için WebAssembly ve JavaScript etkin olmalı.</noscript></div>
 </body>
 </html>
