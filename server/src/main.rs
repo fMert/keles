@@ -183,7 +183,9 @@ fn authenticate(
     if new_hash.is_some() && world.accounts.contains_key(&key) {
         return Err("taken");
     }
-    if world.players.values().any(|p| p.key == key) {
+    if world.players.values().any(|p| p.key == key)
+        || world.matches.values().any(|m| m.keys.contains(&key))
+    {
         return Err("online");
     }
     if world.players.len() >= MAX_CONNECTIONS
@@ -270,7 +272,7 @@ fn info(world: &World, id: u32) {
     let mut top: Vec<_> = world
         .accounts
         .values()
-        .filter(|a| a.wins + a.losses > 0)
+        .filter(|a| a.wins != 0 || a.losses != 0)
         .collect();
     top.sort_unstable_by(|a, b| {
         b.rating
@@ -487,8 +489,8 @@ fn finish_ranked(world: &mut World, match_id: u32, winner: Option<u32>, reason: 
         let a = updated.get_mut(&keys[i]).unwrap();
         a.rating = accounts::elo(old[i], old[1 - i], score);
         // Owner decision: count draws in both columns so draw-only accounts enter TOP.
-        a.wins += u32::from(score >= 0.5);
-        a.losses += u32::from(score <= 0.5);
+        a.wins = a.wins.saturating_add(u32::from(score >= 0.5));
+        a.losses = a.losses.saturating_add(u32::from(score <= 0.5));
     }
     if reason != "cancelled" {
         if let Err(error) = accounts::save(&world.data_path, &updated) {
@@ -921,6 +923,17 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                                 continue;
                             }
                             "QUEUE" => {
+                                if world
+                                    .matches
+                                    .values()
+                                    .any(|m| m.keys.contains(&world.players[&id].key))
+                                {
+                                    let _ = world.players[&id].outgoing.try_send(
+                                        "ERROR|Sonuç kaydediliyor. Biraz sonra yeniden deneyin."
+                                            .to_owned(),
+                                    );
+                                    continue;
+                                }
                                 if world.players[&id].place == Place::Lobby {
                                     let p = world.players.get_mut(&id).unwrap();
                                     p.place = Place::Queue(Instant::now());
@@ -1271,6 +1284,17 @@ mod tests {
             .unwrap()
             .starts_with("RANKED_END|draw|time|1000|+0|"));
         assert_eq!(world.accounts["player1"].rating, 1000);
+        assert_eq!(
+            (
+                world.accounts["player1"].wins,
+                world.accounts["player1"].losses
+            ),
+            (1, 1)
+        );
+        info(&world, 1);
+        assert!(rx[0]
+            .try_iter()
+            .any(|m| m.starts_with("TOP|") && m.contains("Player1:1000:1:1")));
         std::fs::remove_file(&world.data_path).unwrap();
     }
 
@@ -1290,6 +1314,51 @@ mod tests {
         tick(&mut world, &mut Rng::new(7));
         assert_eq!(world.matches.len(), 1);
         assert_eq!(world.matches[&1].players[0], 1, "oldest waiter first");
+    }
+
+    #[test]
+    fn ranked_result_retries_storage_without_losing_or_duplicating_stats() {
+        let (mut world, rx) = ranked_world();
+        tick(&mut world, &mut Rng::new(7));
+        for r in &rx {
+            r.try_iter().for_each(drop);
+        }
+        let path = world.data_path.clone();
+        world.data_path = path.join("missing-parent.tsv");
+        finish_ranked(&mut world, 1, Some(1), "kills");
+        assert_eq!(world.accounts["player1"].rating, 1000);
+        assert!(world.matches[&1].pending.is_some());
+        assert!(rx[0].try_recv().is_err());
+        world.data_path = path;
+        world.matches.get_mut(&1).unwrap().retry_at = Instant::now();
+        tick(&mut world, &mut Rng::new(7));
+        assert!(world.matches.is_empty());
+        assert_eq!(world.accounts["player1"].wins, 1);
+        finish_ranked(&mut world, 1, Some(1), "kills");
+        assert_eq!(world.accounts["player1"].wins, 1);
+        assert_eq!(world.accounts, accounts::load(&world.data_path).unwrap());
+        std::fs::remove_file(world.data_path).unwrap();
+    }
+
+    #[test]
+    fn ranked_respawn_waits_two_seconds_and_keeps_stats() {
+        let (mut world, rx) = ranked_world();
+        let mut rng = Rng::new(7);
+        tick(&mut world, &mut rng);
+        world.matches.get_mut(&1).unwrap().started = true;
+        let p = world.players.get_mut(&1).unwrap();
+        p.health = 0;
+        p.died_at = Some(Instant::now());
+        p.kills = 4;
+        p.deaths = 2;
+        respawn(&mut world, 1, &mut rng);
+        assert_eq!(world.players[&1].health, 0);
+        world.players.get_mut(&1).unwrap().died_at = Some(Instant::now() - Duration::from_secs(2));
+        respawn(&mut world, 1, &mut rng);
+        assert_eq!(world.players[&1].health, MAX_HEALTH);
+        assert_eq!((world.players[&1].kills, world.players[&1].deaths), (4, 2));
+        assert!(rx[0].try_iter().any(|m| m.starts_with("AT|")));
+        assert!(rx[1].try_iter().any(|m| m == "HP|1|3"));
     }
 
     #[test]

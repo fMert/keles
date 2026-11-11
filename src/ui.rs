@@ -664,17 +664,24 @@ impl Game {
             if response.lost_focus() {
                 self.touched[0] = true;
             }
+            let mut focus_password = false;
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Şifre").size(SMALL).color(MUTED));
-                if ui
+                let toggle = ui
                     .small_button(if self.show_password {
                         "gizle"
                     } else {
                         "göster"
                     })
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if toggle.gained_focus() && ui.input(|i| i.key_pressed(Key::Tab)) {
+                    if ui.input(|i| i.modifiers.shift) {
+                        response.request_focus();
+                    } else {
+                        focus_password = true;
+                    }
+                }
+                if toggle.clicked() {
                     self.show_password = !self.show_password;
                 }
             });
@@ -686,6 +693,9 @@ impl Game {
                 !self.show_password,
                 password_error.as_deref(),
             );
+            if focus_password {
+                response.request_focus();
+            }
             if response.lost_focus() {
                 self.touched[1] = true;
             }
@@ -800,7 +810,7 @@ impl Game {
                     self.mode_card(ui,mode_width,true);
                     if !narrow {self.leaderboard_ui(ui,280.0,220.0);}
                 });
-                if narrow {self.leaderboard_ui(ui,outer,68.0);}
+                if narrow {self.leaderboard_ui(ui,outer,88.0);}
                 muted(ui,"WASD hareket · Fare nişan · Boşluk zıpla · Sol tık ateş · Tab skor · Esc menü");
                 if self.pending.is_some(){ui.horizontal(|ui|{spinner(ui);muted(ui,"Odaya bağlanılıyor…");});}
             });
@@ -1176,12 +1186,7 @@ impl Game {
         if !self.connected
             || !matches!(
                 self.screen,
-                Screen::Playing
-                    | Screen::Paused
-                    | Screen::Dead
-                    | Screen::Result
-                    | Screen::MatchIntro
-                    | Screen::Settings
+                Screen::Playing | Screen::Paused | Screen::Dead | Screen::Result
             )
         {
             return;

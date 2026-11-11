@@ -35,8 +35,8 @@ pub fn valid_password(password: &str) -> bool {
     (8..=64).contains(&password.chars().count()) && !password.chars().any(char::is_control)
 }
 
-// RustCrypto/password-hashes, argon2/src/lib.rs lines 36–58, tag argon2-v0.5.3.
-// https://github.com/RustCrypto/password-hashes/blob/argon2-v0.5.3/argon2/src/lib.rs
+// RustCrypto/password-hashes, argon2/src/lib.rs lines 36–58, commit 5b6a74e0799955b21c9d3854de1674a78a472648.
+// https://github.com/RustCrypto/password-hashes/blob/5b6a74e0799955b21c9d3854de1674a78a472648/argon2/src/lib.rs#L36-L58
 // MIT OR Apache-2.0. PHC API usage; HASH_GATE serializes the memory-heavy work.
 pub fn hash(password: &str) -> Result<String, &'static str> {
     let _gate = HASH_GATE.lock().unwrap();
@@ -92,6 +92,9 @@ pub fn load(path: &Path) -> io::Result<HashMap<String, Account>> {
         }
         let phc = PasswordHash::new(fields[2]).map_err(|_| bad())?;
         if phc.algorithm.as_str() != "argon2id" || phc.salt.is_none() || phc.hash.is_none() {
+            return Err(bad());
+        }
+        if argon2::Params::try_from(&phc).is_err() || phc.version != Some(19) {
             return Err(bad());
         }
         let account = Account {

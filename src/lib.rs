@@ -38,6 +38,11 @@ fn valid_password(password: &str) -> bool {
     (8..=64).contains(&password.chars().count()) && !password.chars().any(char::is_control)
 }
 
+// shortcut: the owner keeps auth messages at 256 bytes; widen that limit before supporting every 64-character Unicode password.
+fn auth_fits(name: &str, password: &str, register: bool) -> bool {
+    name.len() + password.len() + if register { 10 } else { 7 } <= 256
+}
+
 fn auth_error(code: &str) -> &'static str {
     match code {
         "bad_username" => "Kullanıcı adı 3–16 harf, rakam, _ veya - içermeli.",
@@ -122,6 +127,8 @@ mod tests {
         assert!(!super::valid_password("short"));
         assert!(!super::valid_password("password\n"));
         assert!(!super::valid_password(&"a".repeat(65)));
+        assert!(super::auth_fits("UserA", &"ş".repeat(64), true));
+        assert!(!super::auth_fits("UserA", &"😀".repeat(64), true));
         assert_eq!(
             super::auth_error("wrong"),
             "Kullanıcı adı veya şifre hatalı."
@@ -449,6 +456,7 @@ struct Game {
     hitmark_at: f64,
     killed_by: Option<String>,
     died_at: f64,
+    last_respawn: f64,
     kills: u32,
     deaths: u32,
     toasts: Vec<(String, f64, bool)>,
@@ -618,6 +626,7 @@ impl Game {
                 hitmark_at: f64::NEG_INFINITY,
                 killed_by: None,
                 died_at: 0.0,
+                last_respawn: f64::NEG_INFINITY,
                 kills: 0,
                 deaths: 0,
                 toasts: Vec::new(),
@@ -691,8 +700,9 @@ impl Game {
             web::document().exit_pointer_lock();
         }
         match screen {
-            Screen::Playing | Screen::Lobby => self.status.clear(),
-            Screen::Dead => self.status = "Yeniden doğmayı bekliyorsun.".to_owned(),
+            Screen::Playing | Screen::Lobby | Screen::Dead | Screen::RankedResult => {
+                self.status.clear()
+            }
             _ => {}
         }
     }
@@ -757,6 +767,9 @@ impl Game {
                 Field::Password,
                 "Şifreniz 8–64 karakter olmalı; kontrol karakteri içermemeli.".to_owned(),
             ));
+        }
+        if self.touched[1] && !auth_fits(&self.username, &self.password, self.register_tab) {
+            return Some((Field::Password,"Kullanıcı adı ve şifre 256 baytlık ileti sınırını aşıyor. Daha kısa bir şifre kullanın.".to_owned()));
         }
         if self.register_tab && self.touched[2] && self.password != self.confirm {
             return Some((Field::Confirm, "Şifreler eşleşmiyor.".to_owned()));
@@ -1189,6 +1202,8 @@ impl Game {
                         self.position = Vec3::new(x, y + map::EYE_HEIGHT, z);
                         self.ground = self.position;
                         self.vertical = 0.0;
+                        // AT is a respawn/reset; its HP frame can arrive on the next UI frame.
+                        self.health = 3;
                         if self.pending.is_some_and(|(action, _)| action == "RESPAWN") {
                             self.pending = None;
                         }
@@ -1821,6 +1836,7 @@ impl eframe::App for Game {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time) * 1000.0;
+        self.last_frame = now;
         if now - self.fps_since >= 500.0 {
             self.fps = (self.fps_frames as f64 * 1000.0 / (now - self.fps_since)).round() as u32;
             if matches!(
@@ -1875,9 +1891,15 @@ impl eframe::App for Game {
             && self.winner.is_none()
             && matches!(self.screen, Screen::Dead | Screen::Paused)
             && now - self.died_at >= 2000.0
-            && self.pending.is_none()
+            && self.pending.is_none_or(|(action, _)| action == "RESPAWN")
+            && now - self.last_respawn >= 250.0
         {
-            self.request("RESPAWN");
+            if self.pending.is_none() {
+                self.request("RESPAWN");
+            } else {
+                self.send("RESPAWN".to_owned());
+            }
+            self.last_respawn = now;
         }
         #[cfg(target_arch = "wasm32")]
         {
