@@ -2,3 +2,5 @@
 /server/target/
 /tools/convert/target/
 /dist/
+keles-accounts.tsv
+*.tsv.tmp

@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, TcpListener, TcpStream},
+    path::PathBuf,
     sync::{
         atomic::{AtomicU32, AtomicUsize, Ordering},
         mpsc::{self, SyncSender},
@@ -11,13 +12,15 @@ use std::{
 };
 use tungstenite::{accept_hdr_with_config, protocol::WebSocketConfig, Error, Message};
 // Shared with the client; each side uses only part of it.
+mod accounts;
 #[allow(dead_code)]
 #[path = "../../src/map.rs"]
 mod map;
+use accounts::Account;
 
 const MAX_PLAYERS: usize = 16;
 // Leave a few bounded handshake slots so full matches can return ERROR.
-const MAX_CONNECTIONS: usize = MAX_PLAYERS + 8;
+const MAX_CONNECTIONS: usize = 160;
 // ponytail: players behind one NAT share this; raise it if they do. Handshakes
 // that never JOIN are bounded by MAX_CONNECTIONS threads and the 5 s timeout.
 const MAX_PER_IP: usize = 4;
@@ -25,6 +28,8 @@ const MAX_HEALTH: u8 = 3;
 const ROUND_RESET: Duration = Duration::from_secs(10);
 
 struct Player {
+    key: String,
+    playing: bool,
     name: String,
     x: f32,
     z: f32,
@@ -42,6 +47,263 @@ struct World {
     girls: u32,
     winner: Option<&'static str>,
     reset_at: Option<Instant>,
+    accounts: HashMap<String, Account>,
+    sessions: HashMap<String, String>,
+    auth_attempts: HashMap<IpAddr, (Instant, u32)>,
+    registrations: HashMap<IpAddr, (Instant, u32)>,
+    data_path: PathBuf,
+}
+
+impl World {
+    fn new(data_path: PathBuf) -> std::io::Result<Self> {
+        Ok(Self {
+            players: HashMap::new(),
+            boys: 0,
+            girls: 0,
+            winner: None,
+            reset_at: None,
+            accounts: accounts::load(&data_path)?,
+            sessions: HashMap::new(),
+            auth_attempts: HashMap::new(),
+            registrations: HashMap::new(),
+            data_path,
+        })
+    }
+}
+
+fn limited(
+    entries: &mut HashMap<IpAddr, (Instant, u32)>,
+    ip: IpAddr,
+    seconds: u64,
+    limit: u32,
+) -> bool {
+    entries.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(seconds));
+    let (_, count) = entries.entry(ip).or_insert((Instant::now(), 0));
+    *count += 1;
+    *count > limit
+}
+
+// Hashing is deliberately outside the World lock, including the unknown-user path.
+fn authenticate(
+    shared: &Shared,
+    ip: IpAddr,
+    text: &str,
+    id: u32,
+    outgoing: SyncSender<String>,
+) -> Result<String, &'static str> {
+    let mut fields = text.splitn(3, '|');
+    let kind = fields.next().unwrap_or_default();
+    let name = fields.next().unwrap_or_default();
+    let password = fields.next().unwrap_or_default();
+    {
+        let mut world = shared.lock().unwrap();
+        if limited(&mut world.auth_attempts, ip, 60, 10)
+            || (kind == "REGISTER" && limited(&mut world.registrations, ip, 3600, 3))
+        {
+            return Err("rate_limited");
+        }
+    }
+    let (key, new_hash) = if kind == "TOKEN" {
+        if name.len() != 64 || !name.bytes().all(|b| b.is_ascii_hexdigit()) || !password.is_empty()
+        {
+            return Err("expired");
+        }
+        let world = shared.lock().unwrap();
+        (world.sessions.get(name).cloned().ok_or("expired")?, None)
+    } else {
+        if !matches!(kind, "LOGIN" | "REGISTER") {
+            return Err("wrong");
+        }
+        if !accounts::valid_username(name) {
+            return Err("bad_username");
+        }
+        if !accounts::valid_password(password) {
+            return Err("bad_password");
+        }
+        let key = name.to_ascii_lowercase();
+        if kind == "REGISTER" {
+            (key, Some(accounts::hash(password)?))
+        } else {
+            let stored = shared
+                .lock()
+                .unwrap()
+                .accounts
+                .get(&key)
+                .map(|a| a.hash.clone());
+            // The same Argon2 cost hides whether the name exists.
+            let correct = match stored {
+                Some(hash) => accounts::verify(password, &hash),
+                None => {
+                    let _ = accounts::hash(password)?;
+                    false
+                }
+            };
+            if !correct {
+                return Err("wrong");
+            }
+            (key, None)
+        }
+    };
+    let mut world = shared.lock().unwrap();
+    if kind == "TOKEN" && world.sessions.get(name) != Some(&key) {
+        return Err("expired");
+    }
+    if new_hash.is_some() && world.accounts.contains_key(&key) {
+        return Err("taken");
+    }
+    if world.players.values().any(|p| p.key == key) {
+        return Err("online");
+    }
+    if world.players.len() >= MAX_CONNECTIONS
+        || world.players.values().filter(|p| p.ip == ip).count() >= MAX_PER_IP
+    {
+        return Err("full");
+    }
+    if let Some(hash) = new_hash {
+        world.accounts.insert(
+            key.clone(),
+            Account {
+                name: name.to_owned(),
+                hash,
+                rating: 1000,
+                wins: 0,
+                losses: 0,
+            },
+        );
+        if let Err(error) = accounts::save(&world.data_path, &world.accounts) {
+            world.accounts.remove(&key);
+            eprintln!("Hesap kaydedilemedi: {error}");
+            return Err("full");
+        }
+    }
+    let token = if kind == "TOKEN" {
+        name.to_owned()
+    } else {
+        world.sessions.retain(|_, owner| owner != &key);
+        let token = accounts::token();
+        world.sessions.insert(token.clone(), key.clone());
+        token
+    };
+    let a = &world.accounts[&key];
+    let response = format!(
+        "AUTH_OK|{}|{token}|{}|{}|{}",
+        a.name, a.rating, a.wins, a.losses
+    );
+    let name = a.name.clone();
+    world.players.insert(
+        id,
+        Player {
+            key,
+            name,
+            playing: false,
+            x: 0.0,
+            z: 0.0,
+            y: 0.0,
+            yaw: 0.0,
+            health: MAX_HEALTH,
+            team: "boys",
+            ip,
+            outgoing,
+        },
+    );
+    Ok(response)
+}
+
+fn info(world: &World, id: u32) {
+    let Some(player) = world.players.get(&id) else {
+        return;
+    };
+    let a = &world.accounts[&player.key];
+    let dm = world.players.values().filter(|p| p.playing).count();
+    let _ = player.outgoing.try_send(format!(
+        "INFO|{}|{dm}|0|{}|{}|{}",
+        world.players.len(),
+        a.rating,
+        a.wins,
+        a.losses
+    ));
+    let mut top: Vec<_> = world
+        .accounts
+        .values()
+        .filter(|a| a.wins + a.losses > 0)
+        .collect();
+    top.sort_unstable_by(|a, b| {
+        b.rating
+            .cmp(&a.rating)
+            .then(b.wins.cmp(&a.wins))
+            .then(a.name.cmp(&b.name))
+    });
+    let top = top
+        .into_iter()
+        .take(10)
+        .map(|a| format!("{}:{}:{}:{}", a.name, a.rating, a.wins, a.losses))
+        .collect::<Vec<_>>()
+        .join(",");
+    let _ = player.outgoing.try_send(format!("TOP|{top}"));
+}
+
+fn play(world: &mut World, id: u32, rng: &mut Rng) {
+    if world.players[&id].playing {
+        return;
+    }
+    let count = world.players.values().filter(|p| p.playing).count();
+    if count >= MAX_PLAYERS {
+        let _ = world.players[&id]
+            .outgoing
+            .try_send("ERROR|Server is full".to_owned());
+        return;
+    }
+    let boys = world
+        .players
+        .values()
+        .filter(|p| p.playing && p.team == "boys")
+        .count();
+    let team = choose_team(boys, count - boys, rng);
+    let (x, z, y) = team_spawn(team, rng);
+    let existing: Vec<_> = world
+        .players
+        .iter()
+        .filter(|(_, p)| p.playing)
+        .map(|(&id, p)| {
+            format!(
+                "ADD|{id}|{}|{}|{}|{}|{}|{}|{}",
+                p.name, p.x, p.z, p.y, p.yaw, p.health, p.team
+            )
+        })
+        .collect();
+    let p = world.players.get_mut(&id).unwrap();
+    (p.x, p.z, p.y, p.yaw, p.health, p.team, p.playing) = (
+        x,
+        z,
+        y,
+        -std::f32::consts::FRAC_PI_2,
+        MAX_HEALTH,
+        team,
+        true,
+    );
+    let _ = p
+        .outgoing
+        .try_send(format!("WELCOME|{id}|{x}|{z}|{y}|{MAX_HEALTH}|{team}"));
+    let _ = p
+        .outgoing
+        .try_send(format!("SCORE|{}|{}", world.boys, world.girls));
+    if let Some(winner) = world.winner {
+        let remaining = world
+            .reset_at
+            .unwrap()
+            .saturating_duration_since(Instant::now())
+            .as_secs()
+            + 1;
+        let _ = p.outgoing.try_send(format!("WIN|{winner}|{remaining}"));
+    }
+    for text in existing {
+        let _ = p.outgoing.try_send(text);
+    }
+    let add = format!(
+        "ADD|{id}|{}|{x}|{z}|{y}|-1.5707964|{MAX_HEALTH}|{team}",
+        p.name
+    );
+    broadcast(&mut world.players, id, &add);
 }
 
 type Shared = Arc<Mutex<World>>;
@@ -96,8 +358,9 @@ fn choose_team(boys: usize, girls: usize, rng: &mut Rng) -> &'static str {
 // A client whose queue is full has fallen behind; dropping it beats letting it
 // miss state such as HP, SCORE or LEAVE.
 fn broadcast(players: &mut HashMap<u32, Player>, except: u32, message: &str) {
-    players
-        .retain(|&id, player| id == except || player.outgoing.try_send(message.to_owned()).is_ok());
+    players.retain(|&id, player| {
+        !player.playing || id == except || player.outgoing.try_send(message.to_owned()).is_ok()
+    });
 }
 
 // Called from every connection loop; the first thread to see the deadline
@@ -115,6 +378,9 @@ fn maybe_reset(world: &mut World, rng: &mut Rng) {
     world.reset_at = None;
     let mut moves = Vec::new();
     for (&id, player) in world.players.iter_mut() {
+        if !player.playing {
+            continue;
+        }
         let (x, z, y) = team_spawn(player.team, rng);
         player.x = x;
         player.z = z;
@@ -187,27 +453,9 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
         .filter(|_| proxied)
         .and_then(|value| value.to_str().ok()?.rsplit(',').next()?.trim().parse().ok())
         .unwrap_or(peer);
-    let Ok(Message::Text(join)) = socket.read() else {
+    let Ok(Message::Text(auth)) = socket.read() else {
         return;
     };
-    let Some(rest) = join.strip_prefix("JOIN|") else {
-        return;
-    };
-    let mut join_fields = rest.split('|');
-    let Some(name) = join_fields.next() else {
-        return;
-    };
-    // Old clients may still send a team; assignment is always authoritative.
-    if name.is_empty()
-        || name.len() > 16
-        || !name
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-    {
-        let _ = socket.send(Message::Text("ERROR|Invalid nickname".into()));
-        return;
-    }
-
     let id = ids.fetch_add(1, Ordering::Relaxed);
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -216,101 +464,14 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
         ^ (id as u64) << 32;
     let mut rng = Rng::new(seed);
     let (outgoing, incoming) = mpsc::sync_channel::<String>(128);
-    let (existing, x, z, y, team, score, winner) = {
-        let mut world = shared.lock().unwrap();
-        if world.players.values().any(|player| player.name == name) {
-            drop(world);
-            let _ = socket.send(Message::Text("ERROR|Nickname already in use".into()));
+    let response = match authenticate(&shared, ip, &auth, id, outgoing) {
+        Ok(response) => response,
+        Err(code) => {
+            let _ = socket.send(Message::Text(format!("AUTH_ERR|{code}").into()));
             return;
         }
-        if world.players.len() >= MAX_PLAYERS {
-            drop(world);
-            let _ = socket.send(Message::Text("ERROR|Server is full".into()));
-            return;
-        }
-        if world
-            .players
-            .values()
-            .filter(|player| player.ip == ip)
-            .count()
-            >= MAX_PER_IP
-        {
-            drop(world);
-            let _ = socket.send(Message::Text(
-                "ERROR|Too many players from your address".into(),
-            ));
-            return;
-        }
-        let boys = world.players.values().filter(|p| p.team == "boys").count();
-        let team = choose_team(boys, world.players.len() - boys, &mut rng);
-        let (x, z, y) = team_spawn(team, &mut rng);
-        let existing = world
-            .players
-            .iter()
-            .map(|(&id, player)| {
-                format!(
-                    "ADD|{id}|{}|{}|{}|{}|{}|{}|{}",
-                    player.name,
-                    player.x,
-                    player.z,
-                    player.y,
-                    player.yaw,
-                    player.health,
-                    player.team
-                )
-            })
-            .collect::<Vec<_>>();
-        world.players.insert(
-            id,
-            Player {
-                name: name.to_owned(),
-                x,
-                z,
-                y,
-                yaw: -std::f32::consts::FRAC_PI_2,
-                health: MAX_HEALTH,
-                team,
-                ip,
-                outgoing,
-            },
-        );
-        broadcast(
-            &mut world.players,
-            id,
-            &format!("ADD|{id}|{name}|{x}|{z}|{y}|-1.5707964|{MAX_HEALTH}|{team}"),
-        );
-        let remaining = world
-            .reset_at
-            .map(|at| at.saturating_duration_since(Instant::now()).as_secs() + 1);
-        (
-            existing,
-            x,
-            z,
-            y,
-            team,
-            (world.boys, world.girls),
-            world.winner.map(|w| (w, remaining.unwrap_or(0))),
-        )
     };
-    let mut ready = socket
-        .send(Message::Text(
-            format!("WELCOME|{id}|{x}|{z}|{y}|{MAX_HEALTH}|{team}").into(),
-        ))
-        .is_ok();
-    if ready {
-        let _ = socket.send(Message::Text(
-            format!("SCORE|{}|{}", score.0, score.1).into(),
-        ));
-        if let Some((winner, remaining)) = winner {
-            let _ = socket.send(Message::Text(format!("WIN|{winner}|{remaining}").into()));
-        }
-        for player in existing {
-            if socket.send(Message::Text(player.into())).is_err() {
-                ready = false;
-                break;
-            }
-        }
-    }
+    let ready = socket.send(Message::Text(response.into())).is_ok();
     let _ = socket
         .get_mut()
         .set_read_timeout(Some(Duration::from_millis(50)));
@@ -318,6 +479,7 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
     if ready {
         let mut last_fire = Instant::now() - Duration::from_secs(1);
         let mut last_pos = last_fire;
+        let mut last_info = last_fire;
         let (mut last_heard, mut last_ping) = (Instant::now(), Instant::now());
         'connected: loop {
             // Browsers answer pings on their own, even while paused, so silence
@@ -342,6 +504,42 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
             }
             match read {
                 Ok(Message::Text(text)) => {
+                    {
+                        let mut world = shared.lock().unwrap();
+                        if !world.players.contains_key(&id) {
+                            break;
+                        }
+                        match text.as_str() {
+                            "LOGOUT" => {
+                                let key = world.players[&id].key.clone();
+                                world.sessions.retain(|_, owner| owner != &key);
+                                break;
+                            }
+                            "INFO" => {
+                                if last_info.elapsed() >= Duration::from_secs(1) {
+                                    info(&world, id);
+                                    last_info = Instant::now();
+                                }
+                                continue;
+                            }
+                            "PLAY" => {
+                                play(&mut world, id, &mut rng);
+                                continue;
+                            }
+                            "LOBBY" => {
+                                if world.players[&id].playing {
+                                    world.players.get_mut(&id).unwrap().playing = false;
+                                    broadcast(&mut world.players, id, &format!("LEAVE|{id}"));
+                                }
+                                info(&world, id);
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        if !world.players[&id].playing {
+                            continue;
+                        }
+                    }
                     let mut fields = text.split('|');
                     match fields.next() {
                         Some("POS") => {
@@ -446,7 +644,11 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                             let mut nearest = map::ray_map(origin, direction);
                             let mut hit = None;
                             for (&target_id, target) in world.players.iter() {
-                                if target_id == id || target.health == 0 || target.team == team {
+                                if target_id == id
+                                    || !target.playing
+                                    || target.health == 0
+                                    || target.team == team
+                                {
                                     continue;
                                 }
                                 if let Some(distance) = ray_box(
@@ -550,13 +752,66 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
         }
     }
     let mut world = shared.lock().unwrap();
-    world.players.remove(&id);
-    broadcast(&mut world.players, id, &format!("LEAVE|{id}"));
+    if world.players.remove(&id).is_some_and(|p| p.playing) {
+        broadcast(&mut world.players, id, &format!("LEAVE|{id}"));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "keles-{}-{}.tsv",
+            std::process::id(),
+            accounts::token()
+        ))
+    }
+
+    #[test]
+    fn accounts_authentication_limits_and_file_roundtrip() {
+        let path = test_path();
+        let shared = Arc::new(Mutex::new(World::new(path.clone()).unwrap()));
+        let ip = "127.0.0.1".parse().unwrap();
+        let (tx, _rx) = mpsc::sync_channel(128);
+        let auth = |id, text: &str| authenticate(&shared, ip, text, id, tx.clone());
+        let ok = auth(1, "REGISTER|UserA|password|with|pipes").unwrap();
+        assert!(ok.starts_with("AUTH_OK|UserA|"));
+        assert_eq!(auth(2, "REGISTER|UserA|password1"), Err("taken"));
+        assert_eq!(auth(2, "REGISTER|usera|password1"), Err("taken"));
+        assert_eq!(auth(2, "LOGIN|UserA|wrongpass"), Err("wrong"));
+        assert_eq!(auth(2, "LOGIN|Missing|wrongpass"), Err("wrong"));
+        assert_eq!(auth(2, "LOGIN|usera|password|with|pipes"), Err("online"));
+        let token = ok.split('|').nth(2).unwrap();
+        shared.lock().unwrap().players.remove(&1);
+        assert!(auth(2, &format!("TOKEN|{token}")).is_ok());
+        {
+            let mut world = shared.lock().unwrap();
+            world.players.remove(&2);
+            world.sessions.retain(|_, key| key != "usera");
+            assert_eq!(accounts::load(&path).unwrap(), world.accounts);
+        }
+        assert_eq!(auth(3, &format!("TOKEN|{token}")), Err("expired"));
+        assert!(auth(3, "LOGIN|USERA|password|with|pipes").is_ok());
+        assert_eq!(auth(4, "LOGIN|Missing|wrongpass"), Err("wrong"));
+        assert_eq!(auth(4, "LOGIN|Missing|wrongpass"), Err("rate_limited"));
+        assert_eq!(accounts::elo(1000, 1000, 1.0), 1016);
+        assert_eq!(accounts::elo(1000, 1000, 0.0), 984);
+        assert_eq!(accounts::elo(1000, 1000, 0.5), 1000);
+        assert!(!accounts::valid_username("ab"));
+        assert!(!accounts::valid_password("short"));
+        assert!(!accounts::valid_password("password\n"));
+        std::fs::write(&path, "# keles accounts v1\nbroken").unwrap();
+        assert!(accounts::load(&path).is_err());
+        std::fs::remove_file(path).unwrap();
+        let mut world = shared.lock().unwrap();
+        world.auth_attempts.clear();
+        world.registrations.clear();
+        for _ in 0..3 {
+            assert!(!limited(&mut world.registrations, ip, 3600, 3));
+        }
+        assert!(limited(&mut world.registrations, ip, 3600, 3));
+    }
 
     #[test]
     fn teams_balance_and_ties_can_choose_either_side() {
@@ -569,13 +824,7 @@ mod tests {
 
     #[test]
     fn websocket_join_movement_damage_and_rejections() {
-        let shared = Arc::new(Mutex::new(World {
-            players: HashMap::new(),
-            boys: 0,
-            girls: 0,
-            winner: None,
-            reset_at: None,
-        }));
+        let shared = Arc::new(Mutex::new(World::new(test_path()).unwrap()));
         let ids = Arc::new(AtomicU32::new(1));
         let connect = || {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -602,11 +851,19 @@ mod tests {
             }
         };
         let (mut first, first_thread) = connect();
-        first.send(Message::Text("JOIN|First".into())).unwrap();
+        first
+            .send(Message::Text("REGISTER|First|password1".into()))
+            .unwrap();
+        read(&mut first, "AUTH_OK|");
+        first.send(Message::Text("PLAY".into())).unwrap();
         let welcome = read(&mut first, "WELCOME|");
         let first_id: u32 = welcome.split('|').nth(1).unwrap().parse().unwrap();
         let (mut second, second_thread) = connect();
-        second.send(Message::Text("JOIN|Second".into())).unwrap();
+        second
+            .send(Message::Text("REGISTER|Second|password2".into()))
+            .unwrap();
+        read(&mut second, "AUTH_OK|");
+        second.send(Message::Text("PLAY".into())).unwrap();
         let other = read(&mut second, "WELCOME|");
         let second_id: u32 = other.split('|').nth(1).unwrap().parse().unwrap();
         assert_ne!(welcome.split('|').last(), other.split('|').last());
@@ -614,15 +871,16 @@ mod tests {
         assert!(read(&mut second, "ADD|").contains("|First|"));
 
         let (mut duplicate, duplicate_thread) = connect();
-        duplicate.send(Message::Text("JOIN|First".into())).unwrap();
-        assert_eq!(
-            read(&mut duplicate, "ERROR|"),
-            "ERROR|Nickname already in use"
-        );
+        duplicate
+            .send(Message::Text("LOGIN|First|password1".into()))
+            .unwrap();
+        assert_eq!(read(&mut duplicate, "AUTH_ERR|"), "AUTH_ERR|online");
         duplicate_thread.join().unwrap();
         let (mut invalid, invalid_thread) = connect();
-        invalid.send(Message::Text("JOIN|bad name".into())).unwrap();
-        assert_eq!(read(&mut invalid, "ERROR|"), "ERROR|Invalid nickname");
+        invalid
+            .send(Message::Text("LOGIN|bad name|password1".into()))
+            .unwrap();
+        assert_eq!(read(&mut invalid, "AUTH_ERR|"), "AUTH_ERR|bad_username");
         invalid_thread.join().unwrap();
 
         // Put the two real connections next to each other on an open spawn terrace.
@@ -655,6 +913,8 @@ mod tests {
                     id,
                     Player {
                         name: format!("Player{id}"),
+                        key: format!("player{id}"),
+                        playing: true,
                         x,
                         z,
                         y,
@@ -668,8 +928,9 @@ mod tests {
             }
         }
         let (mut full, full_thread) = connect();
-        full.send(Message::Text("JOIN|Full".into())).unwrap();
-        assert_eq!(read(&mut full, "ERROR|"), "ERROR|Server is full");
+        full.send(Message::Text("LOGIN|First|password1".into()))
+            .unwrap();
+        assert_eq!(read(&mut full, "AUTH_ERR|"), "AUTH_ERR|full");
         full_thread.join().unwrap();
     }
 
@@ -677,6 +938,8 @@ mod tests {
     fn reset_clears_scores_and_respawns_everyone() {
         let player = |team, outgoing| Player {
             name: String::new(),
+            key: String::new(),
+            playing: true,
             x: 0.0,
             z: 0.0,
             y: 0.0,
@@ -699,6 +962,7 @@ mod tests {
             girls: 40,
             winner: Some("girls"),
             reset_at: Some(Instant::now() - Duration::from_secs(1)),
+            ..World::new(test_path()).unwrap()
         };
         let mut rng = Rng::new(7);
         maybe_reset(&mut world, &mut rng);
@@ -726,13 +990,12 @@ fn main() -> std::io::Result<()> {
         .unwrap_or_else(|| "0.0.0.0:9001".to_owned());
     let listener = TcpListener::bind(&address)?;
     println!("Keles server listening on {address}");
-    let shared: Shared = Arc::new(Mutex::new(World {
-        players: HashMap::new(),
-        boys: 0,
-        girls: 0,
-        winner: None,
-        reset_at: None,
-    }));
+    let data_path = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "keles-accounts.tsv".to_owned());
+    let world = World::new(data_path.into())?;
+    println!("{} hesap yüklendi", world.accounts.len());
+    let shared: Shared = Arc::new(Mutex::new(world));
     let ids = Arc::new(AtomicU32::new(1));
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
