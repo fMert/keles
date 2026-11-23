@@ -304,16 +304,14 @@ fn enter(world: &mut World, id: u32, place: Place, team: &'static str, rng: &mut
         .map(|(&id, p)| add_message(id, p))
         .collect();
     let (x, z, y) = team_spawn(team, rng);
+    let spawn_yaw = if team == "girls" {
+        std::f32::consts::PI
+    } else {
+        -std::f32::consts::FRAC_PI_2
+    };
     let p = world.players.get_mut(&id).unwrap();
-    (p.x, p.z, p.y, p.yaw, p.health, p.team, p.place) = (
-        x,
-        z,
-        y,
-        -std::f32::consts::FRAC_PI_2,
-        MAX_HEALTH,
-        team,
-        place,
-    );
+    (p.x, p.z, p.y, p.yaw, p.health, p.team, p.place) =
+        (x, z, y, spawn_yaw, MAX_HEALTH, team, place);
     (p.kills, p.deaths, p.died_at) = (0, 0, None);
     let _ = p
         .outgoing
@@ -396,14 +394,14 @@ impl Rng {
 // A random point on the team's spawn terrace, snapped to its floor.
 fn team_spawn(team: &str, rng: &mut Rng) -> (f32, f32, f32) {
     let (area, floor) = if team == "girls" {
-        (map::CAMEL_CT_SPAWN, map::CAMEL_CT_FLOOR)
+        (map::KERVAN_CT_SPAWN, map::KERVAN_CT_FLOOR)
     } else {
-        (map::CAMEL_T_SPAWN, map::CAMEL_T_FLOOR)
+        (map::KERVAN_T_SPAWN, map::KERVAN_T_FLOOR)
     };
     for _ in 0..40 {
         let x = area[0] + rng.next_f32() * (area[2] - area[0]);
         let z = area[1] + rng.next_f32() * (area[3] - area[1]);
-        if let Some(y) = map::stand_height(map::Map::Camel, x, z, floor, 0.28) {
+        if let Some(y) = map::stand_height(map::Map::Kervan, x, z, floor, 0.28) {
             return (x, z, y);
         }
     }
@@ -656,8 +654,12 @@ fn revive(world: &mut World, id: u32, rng: &mut Rng) {
     let p = world.players.get_mut(&id).unwrap();
     let place = p.place;
     let (x, z, y) = team_spawn(p.team, rng);
-    (p.x, p.z, p.y, p.yaw, p.health, p.died_at) =
-        (x, z, y, -std::f32::consts::FRAC_PI_2, MAX_HEALTH, None);
+    let spawn_yaw = if p.team == "girls" {
+        std::f32::consts::PI
+    } else {
+        -std::f32::consts::FRAC_PI_2
+    };
+    (p.x, p.z, p.y, p.yaw, p.health, p.died_at) = (x, z, y, spawn_yaw, MAX_HEALTH, None);
     if p.outgoing.try_send(format!("AT|{x}|{y}|{z}")).is_err() {
         p.failed = true;
     }
@@ -671,7 +673,7 @@ fn revive(world: &mut World, id: u32, rng: &mut Rng) {
         &mut world.players,
         place,
         id,
-        &format!("MOVE|{id}|{x}|{z}|{y}|-1.5707964"),
+        &format!("MOVE|{id}|{x}|{z}|{y}|{spawn_yaw}"),
     );
 }
 
@@ -975,7 +977,7 @@ fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
                             // Radius 0: a client stepping out of a wall it landed in is
                             // still partly inside it. ponytail: walls are not checked
                             // here; trace the move segment if wall cheats matter.
-                            let Some(floor) = map::stand_height(map::Map::Camel, x, z, feet, 0.0)
+                            let Some(floor) = map::stand_height(map::Map::Kervan, x, z, feet, 0.0)
                             else {
                                 continue;
                             };

@@ -200,7 +200,7 @@ void main()
         lit += base.rgb * vec3(1.45, 0.68, 0.22) * att;
     }
     float dist = length(v_world - cam_pos);
-    float fog = clamp((dist - 24.0) / 76.0, 0.0, 0.68);
+    float fog = clamp((dist - 30.0) / 88.0, 0.0, 0.54);
     lit = mix(lit, vec3(0.89, 0.79, 0.65), fog);
     color = vec4(lit, base.a);
 }
@@ -332,14 +332,14 @@ const RESOLUTIONS: [[u32; 2]; 13] = [
 // 0 is unlimited.
 const FPS_LIMITS: [u32; 9] = [30, 60, 75, 120, 144, 165, 240, 360, 0];
 
-// Original CC BY 4.0 images embedded in the supplied Sketchfab GLB.
-macro_rules! camel_images {
+// Original DE_KERVAN textures extracted from assets/kervan_original.glb (GPL-3.0-or-later).
+macro_rules! kervan_images {
     ($($index:literal)*) => {
-        [$(include_bytes!(concat!("../assets/camel_images/", $index, ".png")).as_slice()),*]
+        [$(include_bytes!(concat!("../assets/kervan_images/", $index, ".png")).as_slice()),*]
     };
 }
-const CAMEL_IMAGES: [&[u8]; 34] = camel_images!(
-    0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33
+const KERVAN_IMAGES: [&[u8]; 29] = kervan_images!(
+    0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28
 );
 
 // Minecraft Java's 0–200% slider maps to 0–1 before its cubic mouse curve.
@@ -459,7 +459,7 @@ struct Spark {
     at: f64,
 }
 
-struct CamelPart {
+struct KervanPart {
     first: i32,
     count: i32,
     image: usize,
@@ -491,9 +491,9 @@ struct Game {
     program: glow::Program,
     sky_program: glow::Program,
     vao: glow::VertexArray,
-    camel_vao: glow::VertexArray,
-    camel_parts: Vec<CamelPart>,
-    camel_textures: Vec<glow::Texture>,
+    kervan_vao: glow::VertexArray,
+    kervan_parts: Vec<KervanPart>,
+    kervan_textures: Vec<glow::Texture>,
     transform: glow::UniformLocation,
     model_loc: glow::UniformLocation,
     texture_enabled: glow::UniformLocation,
@@ -651,11 +651,11 @@ impl Game {
             egui::TextureOptions::LINEAR,
         );
 
-        let camel_parts = include_str!("../assets/camel_parts.txt")
+        let kervan_parts = include_str!("../assets/kervan_parts.txt")
             .lines()
             .map(|line| {
                 let mut fields = line.split_whitespace();
-                CamelPart {
+                KervanPart {
                     first: fields.next().unwrap().parse().unwrap(),
                     count: fields.next().unwrap().parse().unwrap(),
                     image: fields
@@ -679,10 +679,10 @@ impl Game {
             gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(indices));
             let index_bytes: Vec<u8> = INDICES.iter().flat_map(|i| i.to_ne_bytes()).collect();
             gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, &index_bytes, glow::STATIC_DRAW);
-            // Mesh extracted from the user's Sketchfab GLB by tools/convert (CC BY 4.0).
-            let camel_vao = vertex_array(
+            // Original DE_KERVAN map mesh extracted by tools/convert (GPL-3.0-or-later).
+            let kervan_vao = vertex_array(
                 &gl,
-                include_bytes!("../assets/camel_mesh.bin"),
+                include_bytes!("../assets/kervan_mesh.bin"),
                 20,
                 &[(0, 3, 0), (4, 2, 12)],
             );
@@ -711,9 +711,9 @@ impl Game {
                 program,
                 sky_program,
                 vao,
-                camel_vao,
-                camel_parts,
-                camel_textures: CAMEL_IMAGES
+                kervan_vao,
+                kervan_parts,
+                kervan_textures: KERVAN_IMAGES
                     .iter()
                     .map(|png| texture(&gl, png, glow::REPEAT))
                     .collect(),
@@ -745,7 +745,7 @@ impl Game {
                 last_frame: 0.0,
                 last_draw: 0.0,
                 screen: Screen::Auth,
-                map: Map::Camel,
+                map: Map::Kervan,
                 username: web::storage_get("keles.username").unwrap_or_default(),
                 password: String::new(),
                 confirm: String::new(),
@@ -926,13 +926,13 @@ impl Game {
 
     fn spawn_point(&mut self, team: Team) -> Vec3 {
         let (area, floor) = match team {
-            Team::Boys => (map::CAMEL_T_SPAWN, map::CAMEL_T_FLOOR),
-            Team::Girls => (map::CAMEL_CT_SPAWN, map::CAMEL_CT_FLOOR),
+            Team::Boys => (map::KERVAN_T_SPAWN, map::KERVAN_T_FLOOR),
+            Team::Girls => (map::KERVAN_CT_SPAWN, map::KERVAN_CT_FLOOR),
         };
         for _ in 0..24 {
             let x = area[0] + self.next_rand() * (area[2] - area[0]);
             let z = area[1] + self.next_rand() * (area[3] - area[1]);
-            if let Some(y) = map::stand_height(Map::Camel, x, z, floor, 0.28) {
+            if let Some(y) = map::stand_height(Map::Kervan, x, z, floor, 0.28) {
                 return Vec3::new(x, y, z);
             }
         }
@@ -959,12 +959,12 @@ impl Game {
         self.pitch = 0.0;
         let bots = [
             (1, "Kaptan", Team::Boys, 1),
-            (2, "Bozkurt", Team::Boys, 17),
-            (3, "Demir", Team::Boys, 11),
-            (4, "Aylin", Team::Girls, 9),
-            (5, "Zeynep", Team::Girls, 6),
-            (6, "Ece", Team::Girls, 13),
-            (7, "Defne", Team::Girls, 12),
+            (2, "Bozkurt", Team::Boys, 26),
+            (3, "Demir", Team::Boys, 31),
+            (4, "Aylin", Team::Girls, 17),
+            (5, "Zeynep", Team::Girls, 19),
+            (6, "Ece", Team::Girls, 20),
+            (7, "Defne", Team::Girls, 16),
         ];
         for (id, name, team, wp) in bots {
             let pos = self.spawn_point(team);
@@ -981,7 +981,7 @@ impl Game {
                     yaw: if team == Team::Boys {
                         -std::f32::consts::FRAC_PI_2
                     } else {
-                        std::f32::consts::FRAC_PI_2
+                        std::f32::consts::PI
                     },
                     health: 3,
                     team,
@@ -1001,10 +1001,17 @@ impl Game {
     }
 
     fn respawn_practice_self(&mut self) {
-        let spawn = self.spawn_point(self.team.unwrap_or(Team::Boys));
+        let team = self.team.unwrap_or(Team::Boys);
+        let spawn = self.spawn_point(team);
         self.position = Vec3::new(spawn.x, spawn.y + map::EYE_HEIGHT, spawn.z);
         self.ground = self.position;
         self.vertical = 0.0;
+        self.yaw = if team == Team::Girls {
+            std::f32::consts::PI
+        } else {
+            -std::f32::consts::FRAC_PI_2
+        };
+        self.pitch = 0.0;
         self.health = 3;
         self.streak = 0;
         self.shot_at = f64::NEG_INFINITY;
@@ -1192,7 +1199,7 @@ impl Game {
             if !alive {
                 if now >= respawn_at {
                     let spawn = self.spawn_point(team);
-                    let wp = if team == Team::Boys { 1 } else { 9 };
+                    let wp = if team == Team::Boys { 1 } else { 17 };
                     if let Some(b) = self.remote.get_mut(&id) {
                         (b.x, b.y, b.z) = (spawn.x, spawn.y, spawn.z);
                         b.target = spawn;
@@ -1247,7 +1254,7 @@ impl Game {
                 let step = strafe_dir * 2.1 * dt;
                 let tx = bx + step.x;
                 let tz = bz + step.z;
-                if let Some(fl) = map::stand_height(Map::Camel, tx, tz, by, 0.28) {
+                if let Some(fl) = map::stand_height(Map::Kervan, tx, tz, by, 0.28) {
                     (nx, ny, nz) = (tx, fl, tz);
                 }
                 if now >= bfire {
@@ -1265,7 +1272,7 @@ impl Game {
                     shot_event = Some((eye, dir, dist, target_opt, hit_ok, now + next_cd));
                 }
             } else {
-                let (wp_pos, neighbors) = map::CAMEL_WAYPOINTS[bwp % map::CAMEL_WAYPOINTS.len()];
+                let (wp_pos, neighbors) = map::KERVAN_WAYPOINTS[bwp % map::KERVAN_WAYPOINTS.len()];
                 let dx = wp_pos[0] - bx;
                 let dz = wp_pos[1] - bz;
                 let d = dx.hypot(dz);
@@ -1278,11 +1285,11 @@ impl Game {
                     let speed = 3.35 * dt;
                     let sx = dx / d * speed;
                     let sz = dz / d * speed;
-                    if let Some(fl) = map::stand_height(Map::Camel, bx + sx, bz + sz, by, 0.28) {
+                    if let Some(fl) = map::stand_height(Map::Kervan, bx + sx, bz + sz, by, 0.28) {
                         (nx, ny, nz) = (bx + sx, fl, bz + sz);
-                    } else if let Some(fl) = map::stand_height(Map::Camel, bx + sx, bz, by, 0.28) {
+                    } else if let Some(fl) = map::stand_height(Map::Kervan, bx + sx, bz, by, 0.28) {
                         (nx, ny) = (bx + sx, fl);
-                    } else if let Some(fl) = map::stand_height(Map::Camel, bx, bz + sz, by, 0.28) {
+                    } else if let Some(fl) = map::stand_height(Map::Kervan, bx, bz + sz, by, 0.28) {
                         (ny, nz) = (fl, bz + sz);
                     } else {
                         let idx =
@@ -1881,6 +1888,12 @@ impl Game {
                         } else {
                             Team::Boys
                         });
+                        self.yaw = if team == "girls" {
+                            std::f32::consts::PI
+                        } else {
+                            -std::f32::consts::FRAC_PI_2
+                        };
+                        self.pitch = 0.0;
                         self.pending = None;
                         if self.mode == Mode::Ranked {
                             self.show_screen(Screen::MatchIntro);
@@ -1934,6 +1947,12 @@ impl Game {
                         self.position = Vec3::new(x, y + map::EYE_HEIGHT, z);
                         self.ground = self.position;
                         self.vertical = 0.0;
+                        self.yaw = if self.team == Some(Team::Girls) {
+                            std::f32::consts::PI
+                        } else {
+                            -std::f32::consts::FRAC_PI_2
+                        };
+                        self.pitch = 0.0;
                         // AT is a respawn/reset; its HP frame can arrive on the next UI frame.
                         self.health = 3;
                         if self.pending.is_some_and(|(action, _)| action == "RESPAWN") {
@@ -2285,15 +2304,15 @@ impl Game {
 
         let aspect = width as f32 / height as f32;
         let fov_rad = (70.0 + self.fov_kick).to_radians();
-        let projection = camera::rh::proj::opengl::perspective(fov_rad, aspect, 0.1, 130.0);
+        let projection = camera::rh::proj::opengl::perspective(fov_rad, aspect, 0.1, 145.0);
         let (cam_pos, cam_fwd, cam_up) = if backdrop {
             let angle = now as f32 * 0.000085;
-            let center = Vec3::new(4.0, 3.8, -3.0);
+            let center = Vec3::new(0.0, 5.2, -4.0);
             let eye = center
                 + Vec3::new(
-                    angle.cos() * 21.0,
-                    9.5 + (angle * 1.7).sin() * 2.0,
-                    angle.sin() * 24.0,
+                    angle.cos() * 24.0,
+                    12.5 + (angle * 1.7).sin() * 2.5,
+                    angle.sin() * 26.0,
                 );
             (eye, (center - eye).normalize(), Vec3::Y)
         } else {
@@ -2438,24 +2457,24 @@ impl Game {
                 gl.vertex_attrib_4_f32(3, block.color[0], block.color[1], block.color[2], 1.0);
                 gl.draw_elements(glow::TRIANGLES, 36, glow::UNSIGNED_SHORT, 0);
             }
-            if self.map == Map::Camel {
-                gl.bind_vertex_array(Some(self.camel_vao));
-                let camel_model = Mat4::from_scale(Vec3::splat(map::CAMEL_SCALE));
-                let camel_vp = vp * camel_model;
+            if self.map == Map::Kervan {
+                gl.bind_vertex_array(Some(self.kervan_vao));
+                let kervan_model = Mat4::from_scale(Vec3::splat(map::KERVAN_SCALE));
+                let kervan_vp = vp * kervan_model;
                 gl.uniform_matrix_4_f32_slice(
                     Some(&self.transform),
                     false,
-                    &camel_vp.to_cols_array(),
+                    &kervan_vp.to_cols_array(),
                 );
                 gl.uniform_matrix_4_f32_slice(
                     Some(&self.model_loc),
                     false,
-                    &camel_model.to_cols_array(),
+                    &kervan_model.to_cols_array(),
                 );
                 gl.uniform_1_i32(Some(&self.texture_enabled), 1);
                 gl.vertex_attrib_4_f32(3, 1.0, 1.0, 1.0, 1.0);
-                for part in &self.camel_parts {
-                    gl.bind_texture(glow::TEXTURE_2D, Some(self.camel_textures[part.image]));
+                for part in &self.kervan_parts {
+                    gl.bind_texture(glow::TEXTURE_2D, Some(self.kervan_textures[part.image]));
                     gl.draw_arrays(glow::TRIANGLES, part.first, part.count);
                 }
                 gl.bind_vertex_array(Some(self.vao));

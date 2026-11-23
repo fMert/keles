@@ -1,11 +1,8 @@
 Keles asset and source credits
 
-Camel: "de_dust2 - CS map" by vrchris, CC BY 4.0.
-https://sketchfab.com/3d-models/de-dust2-cs-map-056008d59eb849a29c0ab6884c0c3d87
-https://creativecommons.org/licenses/by/4.0/
-The supplied original is assets/camel_original.glb; tools/convert extracts its
-mesh and textures. The listing is the uploader's license claim; distributors
-should verify rights to this Counter-Strike-derived asset.
+DE_KERVAN: original 3D map and procedural textures authored for Keles
+(GPL-3.0-or-later). Source asset is assets/kervan_original.glb; tools/convert
+extracts its binary mesh, draw manifest, and PNG textures.
 Character turnarounds, logo and weapon images: supplied by the project owner.
 DejaVu Sans: https://github.com/dejavu-fonts/dejavu-fonts, Bitstream Vera license
 with public-domain DejaVu changes (see DejaVu-LICENSE.txt). A long-established

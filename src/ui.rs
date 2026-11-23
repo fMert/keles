@@ -885,7 +885,7 @@ impl Game {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             title(ui, "ANTRENMAN · BOTLARLA ISIN (4v4)", BUTTON, ACCENT_2);
-                            muted(ui, "Beklemeden Dust2 arenasına in, nişanını keskinleştir.");
+                            muted(ui, "Beklemeden DE_KERVAN arenasına in, nişanını keskinleştir.");
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
@@ -1446,8 +1446,8 @@ impl Game {
             }
         }
 
-        // Rotating tactical de_dust2 radar (top-left).
-        if self.show_radar && self.map == Map::Camel {
+        // Rotating tactical DE_KERVAN radar (top-left).
+        if self.show_radar && self.map == Map::Kervan {
             let r = 68.0 * scale;
             let rc = pos2(screen.left() + 20.0 + r, screen.top() + 20.0 + r);
             p.circle_filled(rc, r + 2.0, Color32::from_rgba_unmultiplied(12, 6, 5, 210));
@@ -1520,7 +1520,7 @@ impl Game {
             p.text(
                 pos2(rc.x, rc.y + r + 8.0 * scale),
                 Align2::CENTER_TOP,
-                "DE_CAMEL · RADAR",
+                "DE_KERVAN · RADAR",
                 FontId::proportional(10.0 * scale),
                 MUTED,
             );

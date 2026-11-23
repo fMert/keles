@@ -7,9 +7,9 @@ struct Part {
     image: Option<usize>,
 }
 
-// Source asset: vrchris, "de_dust2 - CS map", Sketchfab,
-// https://sketchfab.com/3d-models/de-dust2-cs-map-056008d59eb849a29c0ab6884c0c3d87
-// CC BY 4.0. The gltf-rs crate parses this GLB; this converter is original Rust.
+// Extracts Keles's original DE_KERVAN map GLB (GPL-3.0-or-later) into a compact
+// binary vertex buffer, draw manifest, and PNG textures. The gltf-rs crate
+// parses the GLB; this converter is original Rust.
 fn visit(
     node: gltf::Node,
     parent: Mat4,
@@ -53,7 +53,9 @@ fn visit(
             parts.push(Part {
                 first,
                 count: vertices.len() - first,
-                image: pbr.base_color_texture().map(|info| info.texture().source().index()),
+                image: pbr
+                    .base_color_texture()
+                    .map(|info| info.texture().source().index()),
             });
         }
     }
@@ -63,7 +65,7 @@ fn visit(
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let gltf = gltf::Gltf::open("assets/camel_original.glb")?;
+    let gltf = gltf::Gltf::open("assets/kervan_original.glb")?;
     let bin = gltf.blob.as_deref().ok_or("Missing GLB binary chunk")?;
     let mut vertices = Vec::new();
     let mut parts = Vec::new();
@@ -89,8 +91,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
     }
-    fs::write("assets/camel_mesh.bin", bytes)?;
-    fs::create_dir_all("assets/camel_images")?;
+    fs::write("assets/kervan_mesh.bin", bytes)?;
+    let _ = fs::remove_dir_all("assets/kervan_images");
+    fs::create_dir_all("assets/kervan_images")?;
     let mut image_names = Vec::new();
     for image in gltf.images() {
         let gltf::image::Source::View { view, mime_type } = image.source() else {
@@ -103,19 +106,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         let name = format!("{}.{}", image.index(), extension);
         let start = view.offset();
-        fs::write(format!("assets/camel_images/{name}"), &bin[start..start + view.length()])?;
+        fs::write(
+            format!("assets/kervan_images/{name}"),
+            &bin[start..start + view.length()],
+        )?;
         image_names.push(name);
     }
     let mut manifest = String::new();
     for part in parts {
         let image = part.image.map(|i| image_names[i].as_str()).unwrap_or("-");
-        writeln!(
-            manifest,
-            "{} {} {}",
-            part.first, part.count, image
-        )?;
+        writeln!(manifest, "{} {} {}", part.first, part.count, image)?;
     }
-    fs::write("assets/camel_parts.txt", manifest)?;
-    println!("{} draw parts, {} images", gltf.meshes().count(), image_names.len());
+    fs::write("assets/kervan_parts.txt", &manifest)?;
+    println!(
+        "{} draw parts, {} images",
+        manifest.lines().count(),
+        image_names.len()
+    );
     Ok(())
 }
