@@ -705,13 +705,19 @@ fn fire(world: &mut World, id: u32, yaw: f32, pitch: f32) {
         pitch.sin(),
         yaw.sin() * pitch.cos(),
     ];
+    broadcast(
+        &mut world.players,
+        place,
+        id,
+        &format!("SHOT|{id}|{yaw:.4}|{pitch:.4}"),
+    );
     let mut nearest = map::ray_map(origin, direction);
     let mut hit = None;
     for (&target_id, target) in &world.players {
         if target_id == id || target.place != place || target.health == 0 || target.team == team {
             continue;
         }
-        if let Some(distance) = ray_box(
+        if let Some(distance) = map::ray_box(
             origin,
             direction,
             [target.x - 0.35, target.y, target.z - 0.35],
@@ -788,30 +794,6 @@ fn fire(world: &mut World, id: u32, yaw: f32, pitch: f32) {
         }
         _ => {}
     }
-}
-
-// Adapted from aevyrie/bevy_mod_raycast/src/primitives.rs, intersects_aabb,
-// lines 164-203: https://github.com/aevyrie/bevy_mod_raycast/blob/main/src/primitives.rs
-// License: MIT (see LICENSE-MIT-bevy_mod_raycast). World-space slab test, with
-// a parallel-axis check so a ray beside a box cannot hit it.
-fn ray_box(origin: [f32; 3], direction: [f32; 3], min: [f32; 3], max: [f32; 3]) -> Option<f32> {
-    let (mut near, mut far) = (0.0_f32, 100.0_f32);
-    for axis in 0..3 {
-        if direction[axis].abs() < 0.000001 {
-            if origin[axis] < min[axis] || origin[axis] > max[axis] {
-                return None;
-            }
-        } else {
-            let a = (min[axis] - origin[axis]) / direction[axis];
-            let b = (max[axis] - origin[axis]) / direction[axis];
-            near = near.max(a.min(b));
-            far = far.min(a.max(b));
-            if near > far {
-                return None;
-            }
-        }
-    }
-    Some(near)
 }
 
 fn handle_client(stream: TcpStream, shared: Shared, ids: Arc<AtomicU32>) {
@@ -1437,6 +1419,7 @@ mod tests {
             .unwrap();
         assert!(read(&mut second, "MOVE|").starts_with(&format!("MOVE|{first_id}|")));
         first.send(Message::Text("FIRE|0|0".into())).unwrap();
+        assert!(read(&mut second, "SHOT|").starts_with(&format!("SHOT|{first_id}|")));
         assert_eq!(read(&mut second, "HP|"), format!("HP|{second_id}|2"));
         first.close(None).unwrap();
         second.close(None).unwrap();

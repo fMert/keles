@@ -29,6 +29,28 @@ pub const CAMEL_T_FLOOR: f32 = 5.97;
 pub const CAMEL_CT_SPAWN: [f32; 4] = [8.77, -25.57, 12.69, -22.87];
 pub const CAMEL_CT_FLOOR: f32 = 1.19;
 
+// Connected Dust2 lane waypoints (x, z) and neighbor indices for solo practice bots.
+pub const CAMEL_WAYPOINTS: &[([f32; 2], &[usize])] = &[
+    ([-11.0, 35.0], &[1, 17]),         // 0 T Spawn
+    ([-1.0, 32.0], &[0, 2, 11]),       // 1 T Right
+    ([10.0, 22.0], &[1, 3, 11]),       // 2 Outside Long
+    ([16.0, 14.0], &[2, 4, 11]),       // 3 Long Doors
+    ([28.0, 10.0], &[3, 5]),           // 4 Long A South
+    ([30.0, -4.0], &[4, 6]),           // 5 Long A Mid
+    ([28.0, -18.0], &[5, 7, 8]),       // 6 A Ramp
+    ([24.0, -26.0], &[6, 8, 12]),      // 7 A Site
+    ([10.5, -24.0], &[6, 7, 9]),       // 8 CT Spawn
+    ([-2.0, -22.0], &[8, 10, 13]),     // 9 Mid Doors
+    ([-1.0, -4.0], &[9, 11, 12]),      // 10 Mid Center
+    ([2.0, 12.0], &[1, 2, 3, 10, 16]), // 11 Top Mid
+    ([10.0, -8.0], &[7, 10]),          // 12 Short / Catwalk
+    ([-12.0, -24.0], &[9, 14]),        // 13 CT to B
+    ([-26.0, -26.0], &[13, 15]),       // 14 B Site
+    ([-26.0, -4.0], &[14, 16]),        // 15 B Tunnels
+    ([-26.0, 14.0], &[11, 15, 17]),    // 16 Upper Tunnels
+    ([-22.0, 26.0], &[0, 16]),         // 17 Outside Tunnels
+];
+
 pub struct Block {
     pub center: [f32; 3],
     pub half: [f32; 3],
@@ -275,6 +297,78 @@ pub fn ray_map(origin: [f32; 3], direction: [f32; 3]) -> f32 {
     nearest
 }
 
+// Adapted from aevyrie/bevy_mod_raycast/src/primitives.rs, intersects_aabb,
+// lines 164-203: https://github.com/aevyrie/bevy_mod_raycast/blob/main/src/primitives.rs
+// License: MIT (see server/LICENSE-MIT-bevy_mod_raycast). World-space slab test, with
+// a parallel-axis check so a ray beside a box cannot hit it.
+pub fn ray_box(origin: [f32; 3], direction: [f32; 3], min: [f32; 3], max: [f32; 3]) -> Option<f32> {
+    let (mut near, mut far) = (0.0_f32, 100.0_f32);
+    for axis in 0..3 {
+        if direction[axis].abs() < 0.000001 {
+            if origin[axis] < min[axis] || origin[axis] > max[axis] {
+                return None;
+            }
+        } else {
+            let a = (min[axis] - origin[axis]) / direction[axis];
+            let b = (max[axis] - origin[axis]) / direction[axis];
+            near = near.max(a.min(b));
+            far = far.min(a.max(b));
+            if near > far {
+                return None;
+            }
+        }
+    }
+    Some(near)
+}
+
+static RADAR_CELLS: OnceLock<Vec<[f32; 2]>> = OnceLock::new();
+
+// Walkable floor footprint sampled from Camel's geometry for the tactical radar.
+pub fn radar_cells() -> &'static [[f32; 2]] {
+    RADAR_CELLS.get_or_init(|| {
+        const GRID: usize = 56;
+        let mut occupied = [false; GRID * GRID];
+        for face in faces() {
+            if face.normal_y.abs() < 0.65 || face.min[1] > 7.2 {
+                continue;
+            }
+            let x0 = (((face.min[0] + 42.0) / 84.0) * GRID as f32)
+                .floor()
+                .clamp(0.0, (GRID - 1) as f32) as usize;
+            let x1 = (((face.max[0] + 42.0) / 84.0) * GRID as f32)
+                .ceil()
+                .clamp(0.0, (GRID - 1) as f32) as usize;
+            let z0 = (((face.min[2] + 50.0) / 100.0) * GRID as f32)
+                .floor()
+                .clamp(0.0, (GRID - 1) as f32) as usize;
+            let z1 = (((face.max[2] + 50.0) / 100.0) * GRID as f32)
+                .ceil()
+                .clamp(0.0, (GRID - 1) as f32) as usize;
+            for gz in z0..=z1 {
+                let wz = -50.0 + (gz as f32 + 0.5) * (100.0 / GRID as f32);
+                for gx in x0..=x1 {
+                    let wx = -42.0 + (gx as f32 + 0.5) * (84.0 / GRID as f32);
+                    if !occupied[gz * GRID + gx] && floor_y(face, wx, wz).is_some() {
+                        occupied[gz * GRID + gx] = true;
+                    }
+                }
+            }
+        }
+        let mut cells = Vec::new();
+        for gz in 0..GRID {
+            for gx in 0..GRID {
+                if occupied[gz * GRID + gx] {
+                    cells.push([
+                        -42.0 + (gx as f32 + 0.5) * (84.0 / GRID as f32),
+                        -50.0 + (gz as f32 + 0.5) * (100.0 / GRID as f32),
+                    ]);
+                }
+            }
+        }
+        cells
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,6 +405,22 @@ mod tests {
             let floor =
                 stand_height(Map::Camel, x, z, terrace, 0.28).expect("team spawn has a floor");
             assert!((floor - terrace).abs() < 0.6, "floor {floor} vs {terrace}");
+        }
+    }
+
+    #[test]
+    fn radar_cells_and_practice_waypoints_cover_walkable_camel_floors() {
+        let cells = radar_cells();
+        assert!(cells.len() > 200, "expected walkable Dust2 radar cells");
+        for &(pos, neighbors) in CAMEL_WAYPOINTS {
+            assert!(!neighbors.is_empty());
+            for &n in neighbors {
+                assert!(n < CAMEL_WAYPOINTS.len());
+            }
+            assert!(
+                floor_at(Map::Camel, pos[0], pos[1], 7.0, STEP_UP).is_some(),
+                "waypoint {pos:?} must sit on a walkable floor"
+            );
         }
     }
 }

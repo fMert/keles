@@ -12,7 +12,7 @@ pub const SUCCESS: Color32 = Color32::from_rgb(0x4a, 0xde, 0x80);
 pub const DANGER: Color32 = Color32::from_rgb(0xff, 0x4d, 0x4d);
 pub const BOYS: Color32 = Color32::from_rgb(0x4a, 0x90, 0xff);
 pub const GIRLS: Color32 = Color32::from_rgb(0xff, 0x66, 0xcc);
-const SCRIM: Color32 = Color32::from_black_alpha(150);
+const SCRIM: Color32 = Color32::from_black_alpha(115);
 const SHADOW: egui::Shadow = egui::Shadow {
     offset: [0, 10],
     blur: 30,
@@ -152,7 +152,7 @@ fn card<R>(
     width: f32,
     contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<R> {
-    egui::Frame::new()
+    let response = egui::Frame::new()
         .fill(PANEL)
         .stroke(Stroke::new(1.0, BORDER))
         .corner_radius(PANEL_RADIUS)
@@ -164,7 +164,26 @@ fn card<R>(
                 contents(ui)
             })
             .inner
-        })
+        });
+    let r = response.response.rect;
+    let p = ui.painter();
+    let tick = Stroke::new(1.5, ACCENT.gamma_multiply(0.55));
+    let len = 10.0;
+    p.line_segment(
+        [
+            r.left_top() + vec2(12.0, 1.0),
+            r.left_top() + vec2(12.0 + len, 1.0),
+        ],
+        tick,
+    );
+    p.line_segment(
+        [
+            r.right_top() - vec2(12.0 + len, -1.0),
+            r.right_top() - vec2(12.0, -1.0),
+        ],
+        tick,
+    );
+    response
 }
 
 fn text_field(
@@ -211,17 +230,57 @@ fn tier(rating: u32) -> (&'static str, Color32) {
 }
 fn tier_badge(ui: &mut egui::Ui, rating: u32) {
     let (name, color) = tier(rating);
+    let rank_idx = match rating {
+        0..900 => 0,
+        900..1100 => 1,
+        1100..1300 => 2,
+        1300..1500 => 3,
+        _ => 4,
+    };
     egui::Frame::new()
-        .fill(color.gamma_multiply(0.12))
-        .stroke(Stroke::new(1.0, color.gamma_multiply(0.6)))
+        .fill(color.gamma_multiply(0.14))
+        .stroke(Stroke::new(1.0, color.gamma_multiply(0.65)))
         .corner_radius(255)
-        .inner_margin(egui::Margin::symmetric(12, 4))
+        .inner_margin(egui::Margin::symmetric(10, 4))
         .show(ui, |ui| {
-            ui.label(
-                RichText::new(format!("{name}  {rating}"))
-                    .size(SMALL)
-                    .color(color),
-            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (emblem, _) = ui.allocate_exact_size(vec2(14.0, 14.0), egui::Sense::hover());
+                let c = emblem.center();
+                let p = ui.painter();
+                let pts = if rank_idx >= 3 {
+                    // Diamond crest for Platinum/Diamond.
+                    vec![
+                        c + vec2(0.0, -6.5),
+                        c + vec2(6.0, 0.0),
+                        c + vec2(0.0, 6.5),
+                        c + vec2(-6.0, 0.0),
+                    ]
+                } else {
+                    // Tactical shield crest for Bronze/Silver/Gold.
+                    vec![
+                        c + vec2(-5.5, -5.5),
+                        c + vec2(5.5, -5.5),
+                        c + vec2(5.5, 0.5),
+                        c + vec2(0.0, 6.5),
+                        c + vec2(-5.5, 0.5),
+                    ]
+                };
+                p.add(egui::Shape::convex_polygon(
+                    pts,
+                    color.gamma_multiply(0.35),
+                    Stroke::new(1.4, color),
+                ));
+                if rank_idx >= 2 {
+                    p.circle_filled(c, 2.0, color);
+                }
+                ui.label(
+                    RichText::new(format!("{name}  {rating}"))
+                        .size(SMALL)
+                        .strong()
+                        .color(color),
+                );
+            });
         });
 }
 
@@ -504,11 +563,17 @@ impl Game {
                                             );
                                         } else if primary_button(
                                             ui,
-                                            "Yeniden doğ",
+                                            "Yeniden doğ (Boşluk)",
                                             self.pending.is_none(),
-                                        ) {
-                                            self.lock_pointer();
-                                            self.request("RESPAWN");
+                                        ) || (self.pending.is_none()
+                                            && ui.input(|i| i.key_pressed(Key::Space)))
+                                        {
+                                            if self.mode == Mode::Practice {
+                                                self.respawn_practice_self();
+                                            } else {
+                                                self.lock_pointer();
+                                                self.request("RESPAWN");
+                                            }
                                         }
                                         if secondary_button(
                                             ui,
@@ -740,8 +805,12 @@ impl Game {
         {
             self.submit_auth();
         }
+        ui.add_space(2.0);
+        if secondary_button(ui, "BOTLARLA HEMEN OYNA (4v4)", !waiting) {
+            self.start_practice(Screen::Auth);
+        }
         ui.label(
-            RichText::new("3–16 harf, rakam, _ veya -")
+            RichText::new("Hesap: 3–16 harf, rakam, _ veya - · Hızlı ısınma için botlara gir")
                 .size(CAPTION)
                 .color(MUTED),
         );
@@ -811,7 +880,29 @@ impl Game {
                     if !narrow {self.leaderboard_ui(ui,280.0,220.0);}
                 });
                 if narrow {self.leaderboard_ui(ui,outer,88.0);}
-                muted(ui,"WASD hareket · Fare nişan · Boşluk zıpla · Sol tık ateş · Tab skor · Esc menü");
+                ui.add_space(6.0);
+                card(ui, outer, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            title(ui, "ANTRENMAN · BOTLARLA ISIN (4v4)", BUTTON, ACCENT_2);
+                            muted(ui, "Beklemeden Dust2 arenasına in, nişanını keskinleştir.");
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(
+                                    enabled,
+                                    egui::Button::new(RichText::new("ISINMAYA GİR").size(BODY).strong())
+                                        .min_size(vec2(180.0, 40.0)),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                self.start_practice(Screen::Lobby);
+                            }
+                        });
+                    });
+                });
+                muted(ui,"WASD hareket · Fare nişan · Boşluk zıpla · Sol tık (basılı tut) ateş · Tab skor · Esc menü");
                 if self.pending.is_some(){ui.horizontal(|ui|{spinner(ui);muted(ui,"Odaya bağlanılıyor…");});}
             });
         });
@@ -1024,12 +1115,18 @@ impl Game {
         let before = self.settings_values();
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
-            title(ui, "Kontroller", BUTTON, ACCENT_2);
+            title(ui, "Kontroller ve Ses", BUTTON, ACCENT_2);
             ui.add(
                 egui::Slider::new(&mut self.sensitivity, 0.0..=200.0)
                     .text("Hassasiyet")
                     .suffix(" %")
                     .step_by(1.0),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.volume, 0.0..=100.0)
+                    .text("Ses düzeyi")
+                    .suffix(" %")
+                    .step_by(5.0),
             );
             title(ui, "Görüntü", BUTTON, ACCENT_2);
             ui.horizontal(|ui| {
@@ -1125,7 +1222,13 @@ impl Game {
             let (rect, _) =
                 ui.allocate_exact_size(vec2(ui.available_width(), 48.0), egui::Sense::hover());
             ui.painter().rect_filled(rect, WIDGET_RADIUS, BG);
-            crosshair(ui.painter(), rect.center(), self.crosshair, 1.0);
+            crosshair(ui.painter(), rect.center(), self.crosshair, 1.0, 0.0);
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.dynamic_crosshair, "Dinamik nişangâh")
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                ui.checkbox(&mut self.show_radar, "Taktik radar")
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+            });
             title(ui, "Efektler", BUTTON, ACCENT_2);
             if ui
                 .checkbox(&mut self.show_blood, "Kan efektleri")
@@ -1138,12 +1241,15 @@ impl Game {
             }
             if secondary_button(ui, "Varsayılanlara dön", true) {
                 self.sensitivity = 50.0;
-                self.hud_scale = 200.0;
+                self.hud_scale = 100.0;
+                self.volume = 70.0;
                 self.show_fps = true;
                 self.show_blood = true;
+                self.dynamic_crosshair = true;
+                self.show_radar = true;
                 self.resolution = None;
                 self.fps_limit = 60;
-                self.crosshair = (0, 8.0, 0);
+                self.crosshair = (0, 7.0, 1);
                 self.fullscreen = false;
                 self.apply_display();
             }
@@ -1194,16 +1300,111 @@ impl Game {
         let screen = ctx.viewport_rect();
         let scale = self.hud_scale / 100.0;
         let p = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("hud")));
+
+        // World-space projected overhead team chevrons & visible enemy tags/HP bars.
+        if self.screen == Screen::Playing {
+            for player in self.remote.values().filter(|rp| rp.health > 0) {
+                let head = Vec3::new(player.x, player.y + 2.08, player.z);
+                let clip = self.last_vp * head.extend(1.0);
+                if clip.w <= 0.1 {
+                    continue;
+                }
+                let ndc = clip.truncate() / clip.w;
+                if ndc.x.abs() > 1.02 || ndc.y.abs() > 1.02 {
+                    continue;
+                }
+                let pos = pos2(
+                    screen.left() + (ndc.x * 0.5 + 0.5) * screen.width(),
+                    screen.top() + (0.5 - ndc.y * 0.5) * screen.height(),
+                );
+                let is_ally = Some(player.team) == self.team;
+                let delta = Vec3::new(player.x, player.y + 1.35, player.z) - self.position;
+                let dist = delta.length();
+                if is_ally {
+                    let alpha = (1.0 - (dist / 65.0)).clamp(0.35, 0.92);
+                    let col = BOYS.gamma_multiply(alpha);
+                    p.text(
+                        pos - vec2(0.0, 12.0 * scale),
+                        Align2::CENTER_BOTTOM,
+                        &player.name,
+                        FontId::proportional(11.0 * scale),
+                        col,
+                    );
+                    p.add(egui::Shape::convex_polygon(
+                        vec![
+                            pos + vec2(-5.0, -9.0) * scale,
+                            pos + vec2(5.0, -9.0) * scale,
+                            pos + vec2(0.0, -2.0) * scale,
+                        ],
+                        col,
+                        Stroke::new(1.0, Color32::from_black_alpha(180)),
+                    ));
+                } else if dist > 0.4 && dist < 40.0 {
+                    let dir = delta / dist;
+                    let visible =
+                        map::ray_map(self.position.to_array(), dir.to_array()) > dist - 0.65;
+                    let recently_hit = self.last_frame - player.hit_at < 900.0;
+                    if visible && (dist < 26.0 || player.health < 3 || recently_hit) {
+                        let col = if recently_hit { ACCENT } else { DANGER };
+                        p.text(
+                            pos - vec2(0.0, 12.0 * scale),
+                            Align2::CENTER_BOTTOM,
+                            &player.name,
+                            FontId::proportional(11.0 * scale),
+                            col.gamma_multiply(0.95),
+                        );
+                        let bw = 34.0 * scale;
+                        let bh = 4.0 * scale;
+                        let bar =
+                            Rect::from_center_size(pos - vec2(0.0, 6.0 * scale), vec2(bw, bh));
+                        p.rect_filled(bar.expand(1.0), 2.0, Color32::from_black_alpha(180));
+                        let pip_w = (bw - 4.0 * scale) / 3.0;
+                        for i in 0..3 {
+                            let pip = Rect::from_min_size(
+                                bar.min + vec2(i as f32 * (pip_w + 2.0 * scale), 0.0),
+                                vec2(pip_w, bh),
+                            );
+                            p.rect_filled(pip, 1.0, if i < player.health { col } else { PANEL_HI });
+                        }
+                    }
+                }
+            }
+        }
+
         if self.screen == Screen::Playing && self.health > 0 {
-            crosshair(&p, screen.center(), self.crosshair, scale);
-            if self.last_frame - self.hitmark_at < 150.0 {
+            let bloom = if self.dynamic_crosshair {
+                let move_bloom = self.bob_amount * 4.5 + if self.was_airborne { 6.0 } else { 0.0 };
+                let shot_bloom = ((240.0 - (self.last_frame - self.shot_at)) / 240.0)
+                    .clamp(0.0, 1.0) as f32
+                    * 9.0;
+                move_bloom + shot_bloom
+            } else {
+                0.0
+            };
+            crosshair(&p, screen.center(), self.crosshair, scale, bloom);
+
+            let kill_age = self.last_frame - self.kill_hit_at;
+            let hit_age = self.last_frame - self.hitmark_at;
+            if kill_age < 260.0 {
+                let t = (1.0 - kill_age as f32 / 260.0).clamp(0.0, 1.0);
+                let pop = 1.0 + t * 0.35;
+                for (a, b) in [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
+                    p.line_segment(
+                        [
+                            screen.center() + vec2(a, b) * 6.5 * scale * pop,
+                            screen.center() + vec2(a, b) * 14.0 * scale * pop,
+                        ],
+                        Stroke::new(2.8 * scale, ACCENT.gamma_multiply(t)),
+                    );
+                }
+            } else if hit_age < 150.0 {
                 for (a, b) in [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
                     p.line_segment(
                         [
                             screen.center() + vec2(a, b) * 6.0 * scale,
-                            screen.center() + vec2(a, b) * 11.0 * scale,
+                            screen.center() + vec2(a, b) * 11.5 * scale,
                         ],
-                        Stroke::new(2.0 * scale, TEXT),
+                        Stroke::new(2.2 * scale, TEXT),
                     );
                 }
             }
@@ -1213,32 +1414,157 @@ impl Game {
                 let points = (0..=24)
                     .map(|i| {
                         let a = i as f32 / 24.0 * std::f32::consts::TAU * cooldown;
-                        screen.center() + vec2(a.cos(), a.sin()) * (self.crosshair.1 + 8.0) * scale
+                        screen.center()
+                            + vec2(a.cos(), a.sin())
+                                * (self.crosshair.1 + 8.0 + bloom * 0.4)
+                                * scale
                     })
                     .collect();
                 p.add(egui::Shape::line(
                     points,
-                    Stroke::new(scale, MUTED.gamma_multiply(0.6)),
+                    Stroke::new(scale, MUTED.gamma_multiply(0.55)),
                 ));
             }
+            // Directional damage indicator arc around crosshair.
+            if let Some((angle, at)) = self.damage_angle {
+                let age = self.last_frame - at;
+                if age < 900.0 {
+                    let alpha = (1.0 - age as f32 / 900.0).clamp(0.0, 1.0);
+                    let rel = angle - self.yaw;
+                    let dir = vec2(rel.sin(), -rel.cos()).normalized();
+                    let perp = vec2(-dir.y, dir.x);
+                    let dist = 48.0 * scale;
+                    let tip = screen.center() + dir * (dist + 10.0 * scale);
+                    let left = screen.center() + dir * dist - perp * 12.0 * scale;
+                    let right = screen.center() + dir * dist + perp * 12.0 * scale;
+                    p.add(egui::Shape::convex_polygon(
+                        vec![tip, left, right],
+                        DANGER.gamma_multiply(alpha * 0.85),
+                        Stroke::NONE,
+                    ));
+                }
+            }
         }
-        let origin = pos2(screen.left() + 24.0, screen.bottom() - 24.0 - 10.0 * scale);
+
+        // Rotating tactical de_dust2 radar (top-left).
+        if self.show_radar && self.map == Map::Camel {
+            let r = 68.0 * scale;
+            let rc = pos2(screen.left() + 20.0 + r, screen.top() + 20.0 + r);
+            p.circle_filled(rc, r + 2.0, Color32::from_rgba_unmultiplied(12, 6, 5, 210));
+            p.circle_stroke(rc, r, Stroke::new(1.5, BORDER));
+            p.circle_stroke(rc, r * 0.55, Stroke::new(0.8, BORDER.gamma_multiply(0.45)));
+            // Subtle FOV cone pointing up.
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    rc,
+                    rc + vec2(-r * 0.52, -r * 0.78),
+                    rc + vec2(r * 0.52, -r * 0.78),
+                ],
+                ACCENT.gamma_multiply(0.11),
+                Stroke::NONE,
+            ));
+            let radar_scale = r / 34.0;
+            let sin_y = self.yaw.sin();
+            let cos_y = self.yaw.cos();
+            let project = |wx: f32, wz: f32| -> Option<egui::Pos2> {
+                let dx = wx - self.position.x;
+                let dz = wz - self.position.z;
+                let rx = dx * (-sin_y) + dz * cos_y;
+                let fy = dx * cos_y + dz * sin_y;
+                let v = vec2(rx, -fy) * radar_scale;
+                (v.length() < r - 4.0).then_some(rc + v)
+            };
+            let cell_col = Color32::from_rgba_unmultiplied(212, 178, 138, 72);
+            let cell_r = (2.1 * scale).max(1.5);
+            for &[wx, wz] in map::radar_cells() {
+                if let Some(pt) = project(wx, wz) {
+                    p.rect_filled(
+                        Rect::from_center_size(pt, vec2(cell_r * 2.0, cell_r * 2.0)),
+                        0.0,
+                        cell_col,
+                    );
+                }
+            }
+            for rp in self.remote.values().filter(|rp| rp.health > 0) {
+                let is_ally = Some(rp.team) == self.team;
+                let shot_recent = self.last_frame - rp.last_shot_at < 2400.0;
+                if !is_ally && !shot_recent {
+                    continue;
+                }
+                if let Some(pt) = project(rp.x, rp.z) {
+                    if is_ally {
+                        p.circle_filled(pt, 3.6 * scale, BOYS);
+                        p.circle_stroke(pt, 3.6 * scale, Stroke::new(1.0, Color32::BLACK));
+                    } else {
+                        let pulse = 1.0
+                            - ((self.last_frame - rp.last_shot_at) as f32 / 2400.0).clamp(0.0, 1.0);
+                        p.circle_stroke(
+                            pt,
+                            (4.0 + (1.0 - pulse) * 7.0) * scale,
+                            Stroke::new(1.2, DANGER.gamma_multiply(pulse)),
+                        );
+                        p.circle_filled(pt, 3.8 * scale, DANGER.gamma_multiply(0.5 + 0.5 * pulse));
+                    }
+                }
+            }
+            // Player arrow at radar center.
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    rc + vec2(0.0, -5.5 * scale),
+                    rc + vec2(-4.2 * scale, 4.5 * scale),
+                    rc + vec2(4.2 * scale, 4.5 * scale),
+                ],
+                TEXT,
+                Stroke::new(1.0, Color32::BLACK),
+            ));
+            p.text(
+                pos2(rc.x, rc.y + r + 8.0 * scale),
+                Align2::CENTER_TOP,
+                "DE_CAMEL · RADAR",
+                FontId::proportional(10.0 * scale),
+                MUTED,
+            );
+        }
+
+        // Bottom-left tactical health + K/D + Streak panel.
+        let status_rect = Rect::from_min_size(
+            pos2(screen.left() + 20.0, screen.bottom() - 20.0 - 66.0 * scale),
+            vec2(198.0, 66.0) * scale,
+        );
+        p.rect_filled(status_rect, 10.0 * scale, PANEL);
+        p.rect_stroke(
+            status_rect,
+            10.0 * scale,
+            Stroke::new(1.0, if self.health == 1 { DANGER } else { BORDER }),
+            StrokeKind::Inside,
+        );
+        let origin = status_rect.min + vec2(14.0, 36.0) * scale;
         p.text(
-            origin - vec2(0.0, 8.0 * scale),
-            Align2::LEFT_BOTTOM,
-            "CAN",
+            status_rect.min + vec2(14.0, 14.0) * scale,
+            Align2::LEFT_CENTER,
+            format!("CAN  {}/3", self.health),
+            FontId::proportional(CAPTION * scale),
+            if self.health == 1 { DANGER } else { TEXT },
+        );
+        p.text(
+            pos2(
+                status_rect.right() - 14.0 * scale,
+                status_rect.top() + 14.0 * scale,
+            ),
+            Align2::RIGHT_CENTER,
+            format!("{} / {} K/Ö", self.kills, self.deaths),
             FontId::proportional(CAPTION * scale),
             MUTED,
         );
         for i in 0..3 {
             let rect = Rect::from_min_size(
-                origin + vec2(i as f32 * 42.0 * scale, 0.0),
-                vec2(36.0, 10.0) * scale,
+                origin + vec2(i as f32 * 58.0 * scale, 0.0),
+                vec2(52.0, 14.0) * scale,
             );
             let color = if i < self.health {
                 if self.health == 1 {
                     DANGER
-                        .gamma_multiply(0.65 + 0.35 * (self.last_frame as f32 * 0.006).sin().abs())
+                        .gamma_multiply(0.65 + 0.35 * (self.last_frame as f32 * 0.008).sin().abs())
                 } else {
                     ACCENT_2
                 }
@@ -1247,6 +1573,30 @@ impl Game {
             };
             p.rect_filled(rect, 3.0 * scale, color);
         }
+        if self.streak >= 2 {
+            let streak_rect = Rect::from_min_size(
+                pos2(
+                    status_rect.right() + 10.0 * scale,
+                    status_rect.bottom() - 34.0 * scale,
+                ),
+                vec2(106.0, 34.0) * scale,
+            );
+            p.rect_filled(streak_rect, 8.0 * scale, ACCENT.gamma_multiply(0.22));
+            p.rect_stroke(
+                streak_rect,
+                8.0 * scale,
+                Stroke::new(1.2, ACCENT),
+                StrokeKind::Inside,
+            );
+            p.text(
+                streak_rect.center(),
+                Align2::CENTER_CENTER,
+                format!("★ {} SERİ", self.streak),
+                FontId::proportional(SMALL * scale),
+                ACCENT_2,
+            );
+        }
+
         if self.show_fps {
             p.text(
                 screen.right_bottom() - vec2(16.0, 16.0),
@@ -1257,8 +1607,8 @@ impl Game {
             );
         }
         let panel = Rect::from_center_size(
-            pos2(screen.center().x, 16.0 + 32.0 * scale),
-            vec2(330.0, 64.0) * scale,
+            pos2(screen.center().x, 16.0 + 34.0 * scale),
+            vec2(356.0, 68.0) * scale,
         );
         p.add(SHADOW.as_shape(panel, PANEL_RADIUS));
         p.rect_filled(panel, PANEL_RADIUS, PANEL);
@@ -1274,7 +1624,8 @@ impl Game {
         } else {
             self.score
         };
-        for (i, dx) in [-104.0, 104.0].into_iter().enumerate() {
+        let target = self.kill_target.max(1) as f32;
+        for (i, dx) in [-112.0, 112.0].into_iter().enumerate() {
             let team = if self.mode == Mode::Ranked {
                 if i == 0 {
                     self.team.unwrap_or(Team::Boys)
@@ -1298,37 +1649,100 @@ impl Game {
                 team.label()
             };
             p.text(
-                center + vec2(dx, -16.0) * scale,
+                center + vec2(dx, -18.0) * scale,
                 Align2::CENTER_CENTER,
                 label,
                 FontId::proportional(CAPTION * scale),
                 team.color(),
             );
             p.text(
-                center + vec2(dx, 10.0) * scale,
+                center + vec2(dx, 6.0) * scale,
                 Align2::CENTER_CENTER,
                 scores[i].to_string(),
                 FontId::proportional(SECTION * scale),
                 team.color(),
             );
+            let frac = (scores[i] as f32 / target).clamp(0.0, 1.0);
+            let bw = 96.0 * scale;
+            let bar =
+                Rect::from_center_size(center + vec2(dx, 26.0) * scale, vec2(bw, 4.0 * scale));
+            p.rect_filled(bar, 2.0, PANEL_HI);
+            p.rect_filled(
+                Rect::from_min_size(bar.min, vec2(bw * frac, 4.0 * scale)),
+                2.0,
+                team.color(),
+            );
         }
         p.text(
-            center - vec2(0.0, 12.0 * scale),
+            center - vec2(0.0, 14.0 * scale),
             Align2::CENTER_CENTER,
-            format!("İlk {}", self.kill_target),
-            FontId::proportional(CAPTION * scale),
+            match self.mode {
+                Mode::Practice => format!("BOT · İlk {}", self.kill_target),
+                Mode::Deathmatch => format!("İlk {}", self.kill_target),
+                Mode::Ranked => format!("1v1 · İlk {}", self.kill_target),
+            },
+            FontId::proportional(11.0 * scale),
             MUTED,
         );
         if self.mode == Mode::Ranked {
             let left = (self.ranked_ends_at - self.last_frame) / 1000.0;
             p.text(
-                center + vec2(0.0, 12.0 * scale),
+                center + vec2(0.0, 10.0 * scale),
                 Align2::CENTER_CENTER,
                 clock(left),
                 FontId::proportional(BODY * scale),
                 if left < 30.0 { DANGER } else { TEXT },
             );
         }
+
+        // Animated Kill Streak / Multi-Kill Banner.
+        if let Some((headline, victim, at)) = &self.kill_banner {
+            let age = self.last_frame - at;
+            if age < 2200.0 {
+                let alpha =
+                    ((age / 140.0).min(1.0) * ((2200.0 - age) / 500.0).clamp(0.0, 1.0)) as f32;
+                let slide = (1.0 - (age / 180.0).min(1.0) as f32) * 10.0;
+                let b_center = pos2(screen.center().x, panel.bottom() + 34.0 * scale - slide);
+                let is_multi = headline != "+1 LEŞ";
+                let banner_rect = Rect::from_center_size(
+                    b_center,
+                    vec2(if is_multi { 260.0 } else { 190.0 }, 42.0) * scale,
+                );
+                p.rect_filled(
+                    banner_rect,
+                    8.0 * scale,
+                    if is_multi {
+                        Color32::from_rgba_unmultiplied(44, 14, 8, (220.0 * alpha) as u8)
+                    } else {
+                        PANEL.gamma_multiply(alpha)
+                    },
+                );
+                p.rect_stroke(
+                    banner_rect,
+                    8.0 * scale,
+                    Stroke::new(
+                        1.5,
+                        (if is_multi { ACCENT } else { BORDER }).gamma_multiply(alpha),
+                    ),
+                    StrokeKind::Inside,
+                );
+                p.text(
+                    b_center - vec2(0.0, 7.0 * scale),
+                    Align2::CENTER_CENTER,
+                    headline,
+                    FontId::proportional((if is_multi { 17.0 } else { 14.0 }) * scale),
+                    (if is_multi { ACCENT_2 } else { TEXT }).gamma_multiply(alpha),
+                );
+                p.text(
+                    b_center + vec2(0.0, 10.0 * scale),
+                    Align2::CENTER_CENTER,
+                    format!("✕ {victim}"),
+                    FontId::proportional(11.0 * scale),
+                    MUTED.gamma_multiply(alpha),
+                );
+            }
+        }
+
         egui::Area::new(Id::new("kill-feed"))
             .anchor(Align2::RIGHT_TOP, vec2(-16.0, panel.bottom() + 16.0))
             .show(ctx, |ui| {
@@ -1350,13 +1764,18 @@ impl Game {
                                     BORDER
                                 },
                             ))
-                            .inner_margin(8)
+                            .inner_margin(egui::Margin::symmetric(10, 6))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        RichText::new(killer).size(SMALL * scale).color(kt.color()),
+                                        RichText::new(killer)
+                                            .size(SMALL * scale)
+                                            .strong()
+                                            .color(kt.color()),
                                     );
-                                    ui.label(RichText::new("▸").size(SMALL * scale));
+                                    ui.label(
+                                        RichText::new("[AK]").size(11.0 * scale).color(ACCENT_2),
+                                    );
                                     ui.label(
                                         RichText::new(victim).size(SMALL * scale).color(vt.color()),
                                     );
@@ -1374,7 +1793,7 @@ impl Game {
                     0,
                     Stroke::new(
                         3.0,
-                        DANGER.gamma_multiply(alpha * (1.0 - i as f32 / 12.0) * 0.2),
+                        DANGER.gamma_multiply(alpha * (1.0 - i as f32 / 12.0) * 0.28),
                     ),
                     StrokeKind::Inside,
                 );
@@ -1479,9 +1898,11 @@ fn crosshair(
     center: egui::Pos2,
     (style, size, color): (usize, f32, usize),
     scale: f32,
+    bloom: f32,
 ) {
     let color = CROSSHAIR_COLORS[color];
     if style != 1 {
+        let gap = (3.0 + bloom) * scale;
         for direction in [
             vec2(1.0, 0.0),
             vec2(-1.0, 0.0),
@@ -1489,8 +1910,8 @@ fn crosshair(
             vec2(0.0, -1.0),
         ] {
             let segment = [
-                center + direction * 3.0 * scale,
-                center + direction * (size + 3.0) * scale,
+                center + direction * gap,
+                center + direction * (gap + size * scale),
             ];
             p.line_segment(segment, Stroke::new(4.0 * scale, Color32::BLACK));
             p.line_segment(segment, Stroke::new(2.0 * scale, color));

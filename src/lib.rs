@@ -25,6 +25,12 @@ mod web {
     }
     pub fn storage_set(_: &str, _: &str) {}
     pub fn storage_remove(_: &str) {}
+    pub fn sfx_fire(_: f32, _: f32) {}
+    pub fn sfx_hit(_: f32, _: bool, _: u32) {}
+    pub fn sfx_hurt(_: f32) {}
+    pub fn sfx_step(_: f32, _: bool) {}
+    pub fn sfx_tick(_: f32, _: bool) {}
+    pub fn sfx_end(_: f32, _: bool) {}
 }
 
 fn valid_username(name: &str) -> bool {
@@ -137,7 +143,7 @@ mod tests {
 }
 
 // GLSL lines from WebGLSamples/WebGL2Samples/samples/transform_feedback_interleaved.html,
-// lines 20-33 and 52-84; the vertex shader combines its MVP and color snippets.
+// lines 20-33 and 52-84; extended with world-space directional sunlight, muzzle light, and fog.
 // https://github.com/WebGLSamples/WebGL2Samples/blob/master/samples/transform_feedback_interleaved.html
 // License: MIT (see LICENSE-MIT-WebGL2Samples).
 const VERTEX_SHADER: &str = r#"#version 300 es
@@ -146,16 +152,19 @@ const VERTEX_SHADER: &str = r#"#version 300 es
 precision highp float;
 precision highp int;
 uniform mat4 MVP;
+uniform mat4 MODEL;
 layout(location = POSITION_LOCATION) in vec4 position;
 layout(location = COLOR_POSITION) in vec4 color;
 layout(location = 4) in vec2 texcoord;
 out vec4 v_color;
 out vec2 v_uv;
+out vec3 v_world;
 void main()
 {
     gl_Position = MVP * position;
     v_color = color;
     v_uv = texcoord;
+    v_world = (MODEL * position).xyz;
 }
 "#;
 const FRAGMENT_SHADER: &str = r#"#version 300 es
@@ -163,13 +172,76 @@ precision highp float;
 precision highp int;
 in vec4 v_color;
 in vec2 v_uv;
+in vec3 v_world;
 uniform sampler2D diffuse;
 uniform bool use_texture;
+uniform bool unlit;
+uniform vec3 cam_pos;
+uniform vec3 muzzle_pos;
+uniform float muzzle_light;
 out vec4 color;
 void main()
 {
-    color = v_color;
-    if (use_texture) color.rgb *= texture(diffuse, v_uv).rgb;
+    vec4 base = v_color;
+    if (use_texture) base.rgb *= texture(diffuse, v_uv).rgb;
+    if (unlit) {
+        color = base;
+        return;
+    }
+    vec3 n = normalize(cross(dFdx(v_world), dFdy(v_world)));
+    if (!gl_FrontFacing) n = -n;
+    vec3 sun_dir = normalize(vec3(0.58, 0.56, -0.42));
+    float ndl = max(dot(n, sun_dir), 0.0);
+    vec3 hemi = mix(vec3(0.46, 0.37, 0.27), vec3(0.58, 0.68, 0.80), n.y * 0.5 + 0.5);
+    vec3 lit = base.rgb * (hemi * 0.72 + vec3(1.12, 0.99, 0.82) * (0.20 + 0.62 * ndl));
+    if (muzzle_light > 0.001) {
+        float d = length(v_world - muzzle_pos);
+        float att = muzzle_light / (1.0 + d * d * 0.32);
+        lit += base.rgb * vec3(1.45, 0.68, 0.22) * att;
+    }
+    float dist = length(v_world - cam_pos);
+    float fog = clamp((dist - 24.0) / 76.0, 0.0, 0.68);
+    lit = mix(lit, vec3(0.89, 0.79, 0.65), fog);
+    color = vec4(lit, base.a);
+}
+"#;
+
+const SKY_VERTEX_SHADER: &str = r#"#version 300 es
+#define POSITION_LOCATION 0
+precision highp float;
+layout(location = POSITION_LOCATION) in vec2 position;
+out vec2 v_ndc;
+void main()
+{
+    v_ndc = position;
+    gl_Position = vec4(position, 0.999, 1.0);
+}
+"#;
+const SKY_FRAGMENT_SHADER: &str = r#"#version 300 es
+precision highp float;
+in vec2 v_ndc;
+uniform vec3 cam_fwd;
+uniform vec3 cam_right;
+uniform vec3 cam_up;
+uniform float aspect;
+uniform float tan_half_fov;
+out vec4 color;
+void main()
+{
+    vec3 dir = normalize(cam_fwd + v_ndc.x * aspect * tan_half_fov * cam_right + v_ndc.y * tan_half_fov * cam_up);
+    float h = clamp(dir.y, -0.25, 1.0);
+    vec3 horizon = vec3(0.93, 0.80, 0.63);
+    vec3 mid_sky = vec3(0.52, 0.72, 0.88);
+    vec3 zenith  = vec3(0.20, 0.43, 0.73);
+    vec3 sky = mix(horizon, mid_sky, smoothstep(-0.04, 0.28, h));
+    sky = mix(sky, zenith, smoothstep(0.24, 0.82, h));
+    vec3 sun_dir = normalize(vec3(0.58, 0.56, -0.42));
+    float sun = max(dot(dir, sun_dir), 0.0);
+    sky += vec3(1.0, 0.72, 0.36) * pow(sun, 10.0) * 0.38;
+    sky += vec3(1.0, 0.95, 0.80) * smoothstep(0.9975, 0.9994, sun) * 0.9;
+    float haze = smoothstep(0.18, -0.05, h);
+    sky = mix(sky, vec3(0.87, 0.75, 0.59), haze * 0.45);
+    color = vec4(sky, 1.0);
 }
 "#;
 
@@ -195,11 +267,15 @@ const SPRITE_FRAGMENT_SHADER: &str = r#"#version 300 es
 precision highp float;
 precision highp int;
 uniform sampler2D diffuse;
+uniform vec4 tint;
+uniform vec4 flash;
 in vec2 v_st;
 out vec4 color;
 void main()
 {
-    color = texture(diffuse, v_st);
+    vec4 tex = texture(diffuse, v_st);
+    vec3 rgb = mix(tex.rgb * tint.rgb, flash.rgb, flash.a);
+    color = vec4(rgb, tex.a * tint.a);
 }
 "#;
 
@@ -299,6 +375,7 @@ enum Screen {
 enum Mode {
     Deathmatch,
     Ranked,
+    Practice,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Field {
@@ -355,12 +432,31 @@ struct RemotePlayer {
     team: Team,
     kills: u32,
     deaths: u32,
+    hit_at: f64,
+    last_shot_at: f64,
+    bot_wp: usize,
+    bot_fire_at: f64,
+    bot_strafe: f32,
+    bot_respawn_at: f64,
 }
 
 struct BloodEffect {
     position: Vec3,
     at: f64,
     death: bool,
+}
+
+struct Tracer {
+    start: Vec3,
+    end: Vec3,
+    at: f64,
+    mine: bool,
+}
+
+struct Spark {
+    position: Vec3,
+    velocity: Vec3,
+    at: f64,
 }
 
 struct CamelPart {
@@ -393,17 +489,30 @@ struct Game {
     ctx: egui::Context,
     gl: Arc<glow::Context>,
     program: glow::Program,
+    sky_program: glow::Program,
     vao: glow::VertexArray,
     camel_vao: glow::VertexArray,
     camel_parts: Vec<CamelPart>,
     camel_textures: Vec<glow::Texture>,
     transform: glow::UniformLocation,
+    model_loc: glow::UniformLocation,
     texture_enabled: glow::UniformLocation,
+    unlit_loc: glow::UniformLocation,
+    cam_pos_loc: glow::UniformLocation,
+    muzzle_pos_loc: glow::UniformLocation,
+    muzzle_light_loc: glow::UniformLocation,
+    sky_fwd_loc: glow::UniformLocation,
+    sky_right_loc: glow::UniformLocation,
+    sky_up_loc: glow::UniformLocation,
+    sky_aspect_loc: glow::UniformLocation,
+    sky_fov_loc: glow::UniformLocation,
     sprite_program: glow::Program,
     sprite_vao: glow::VertexArray,
     operative_vaos: Vec<glow::VertexArray>,
     girl_vaos: Vec<glow::VertexArray>,
     sprite_transform: glow::UniformLocation,
+    sprite_tint: glow::UniformLocation,
+    sprite_flash: glow::UniformLocation,
     textures: [glow::Texture; 3],
     operative_texture: glow::Texture,
     girl_texture: glow::Texture,
@@ -454,13 +563,24 @@ struct Game {
     ranked_result: Option<RankedResult>,
     kill_feed: Vec<(String, String, Team, Team, f64)>,
     hitmark_at: f64,
+    kill_hit_at: f64,
     killed_by: Option<String>,
     died_at: f64,
     last_respawn: f64,
     kills: u32,
     deaths: u32,
+    streak: u32,
+    best_streak: u32,
+    multi_kill: u32,
+    last_kill_at: f64,
+    kill_banner: Option<(String, String, f64)>,
+    damage_angle: Option<(f32, f64)>,
+    last_countdown_sec: u32,
     toasts: Vec<(String, f64, bool)>,
     crosshair: (usize, f32, usize),
+    dynamic_crosshair: bool,
+    show_radar: bool,
+    volume: f32,
     confirm_leave: bool,
     status: String,
     sensitivity: f32,
@@ -485,10 +605,25 @@ struct Game {
     last_sent: f64,
     remote: HashMap<u32, RemotePlayer>,
     blood: Vec<BloodEffect>,
+    tracers: Vec<Tracer>,
+    sparks: Vec<Spark>,
     local_hit_at: f64,
     grabbed: bool,
     mouse_delta: Vec2,
     connect_deadline: f64,
+    // Camera and weapon feel state.
+    recoil_pitch: f32,
+    strafe_roll: f32,
+    fov_kick: f32,
+    weapon_sway: Vec2,
+    bob_phase: f32,
+    bob_amount: f32,
+    land_dip: f32,
+    was_airborne: bool,
+    step_dist: f32,
+    last_vp: Mat4,
+    practice_rng: u64,
+    practice_back: Screen,
 }
 
 impl Game {
@@ -537,6 +672,7 @@ impl Game {
 
         let mut game = unsafe {
             let program = link_program(&gl, VERTEX_SHADER, FRAGMENT_SHADER);
+            let sky_program = link_program(&gl, SKY_VERTEX_SHADER, SKY_FRAGMENT_SHADER);
             let sprite_program = link_program(&gl, SPRITE_VERTEX_SHADER, SPRITE_FRAGMENT_SHADER);
             let vao = vertex_array(&gl, &floats(&VERTICES), 0, &[(0, 3, 0)]);
             let indices = gl.create_buffer().expect("No index buffer");
@@ -556,9 +692,24 @@ impl Game {
             Game {
                 ctx: ctx.clone(),
                 transform: gl.get_uniform_location(program, "MVP").unwrap(),
+                model_loc: gl.get_uniform_location(program, "MODEL").unwrap(),
                 texture_enabled: gl.get_uniform_location(program, "use_texture").unwrap(),
+                unlit_loc: gl.get_uniform_location(program, "unlit").unwrap(),
+                cam_pos_loc: gl.get_uniform_location(program, "cam_pos").unwrap(),
+                muzzle_pos_loc: gl.get_uniform_location(program, "muzzle_pos").unwrap(),
+                muzzle_light_loc: gl.get_uniform_location(program, "muzzle_light").unwrap(),
+                sky_fwd_loc: gl.get_uniform_location(sky_program, "cam_fwd").unwrap(),
+                sky_right_loc: gl.get_uniform_location(sky_program, "cam_right").unwrap(),
+                sky_up_loc: gl.get_uniform_location(sky_program, "cam_up").unwrap(),
+                sky_aspect_loc: gl.get_uniform_location(sky_program, "aspect").unwrap(),
+                sky_fov_loc: gl
+                    .get_uniform_location(sky_program, "tan_half_fov")
+                    .unwrap(),
                 sprite_transform: gl.get_uniform_location(sprite_program, "MVP").unwrap(),
+                sprite_tint: gl.get_uniform_location(sprite_program, "tint").unwrap(),
+                sprite_flash: gl.get_uniform_location(sprite_program, "flash").unwrap(),
                 program,
+                sky_program,
                 vao,
                 camel_vao,
                 camel_parts,
@@ -624,17 +775,28 @@ impl Game {
                 ranked_result: None,
                 kill_feed: Vec::new(),
                 hitmark_at: f64::NEG_INFINITY,
+                kill_hit_at: f64::NEG_INFINITY,
                 killed_by: None,
                 died_at: 0.0,
                 last_respawn: f64::NEG_INFINITY,
                 kills: 0,
                 deaths: 0,
+                streak: 0,
+                best_streak: 0,
+                multi_kill: 0,
+                last_kill_at: f64::NEG_INFINITY,
+                kill_banner: None,
+                damage_angle: None,
+                last_countdown_sec: 0,
                 toasts: Vec::new(),
-                crosshair: (0, 8.0, 0),
+                crosshair: (0, 7.0, 1),
+                dynamic_crosshair: true,
+                show_radar: true,
+                volume: 70.0,
                 confirm_leave: false,
                 status: String::new(),
                 sensitivity: 50.0,
-                hud_scale: 200.0,
+                hud_scale: 100.0,
                 show_fps: true,
                 show_blood: true,
                 fullscreen: false,
@@ -655,10 +817,24 @@ impl Game {
                 last_sent: 0.0,
                 remote: HashMap::new(),
                 blood: Vec::new(),
+                tracers: Vec::new(),
+                sparks: Vec::new(),
                 local_hit_at: f64::NEG_INFINITY,
                 grabbed: false,
                 mouse_delta: Vec2::ZERO,
                 connect_deadline: 0.0,
+                recoil_pitch: 0.0,
+                strafe_roll: 0.0,
+                fov_kick: 0.0,
+                weapon_sway: Vec2::ZERO,
+                bob_phase: 0.0,
+                bob_amount: 0.0,
+                land_dip: 0.0,
+                was_airborne: false,
+                step_dist: 0.0,
+                last_vp: Mat4::IDENTITY,
+                practice_rng: 0x517c_c1b7_2722_0a95,
+                practice_back: Screen::Auth,
             }
         };
         game.load_settings();
@@ -673,6 +849,8 @@ impl Game {
         self.socket = None;
         self.remote.clear();
         self.blood.clear();
+        self.tracers.clear();
+        self.sparks.clear();
         self.local_hit_at = f64::NEG_INFINITY;
         self.connected = false;
         self.team = None;
@@ -720,7 +898,505 @@ impl Game {
     }
 
     fn lobby(&mut self) {
+        if self.mode == Mode::Practice {
+            let back = if self.account.is_some() {
+                Screen::Lobby
+            } else {
+                self.practice_back
+            };
+            self.clear_match();
+            self.mode = Mode::Deathmatch;
+            self.show_screen(back);
+            if self.account.is_some() {
+                self.send("INFO".to_owned());
+            }
+            return;
+        }
         self.request("LOBBY");
+    }
+
+    fn next_rand(&mut self) -> f32 {
+        let mut x = self.practice_rng | 1;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.practice_rng = x;
+        ((x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32) / ((1u64 << 24) as f32)
+    }
+
+    fn spawn_point(&mut self, team: Team) -> Vec3 {
+        let (area, floor) = match team {
+            Team::Boys => (map::CAMEL_T_SPAWN, map::CAMEL_T_FLOOR),
+            Team::Girls => (map::CAMEL_CT_SPAWN, map::CAMEL_CT_FLOOR),
+        };
+        for _ in 0..24 {
+            let x = area[0] + self.next_rand() * (area[2] - area[0]);
+            let z = area[1] + self.next_rand() * (area[3] - area[1]);
+            if let Some(y) = map::stand_height(Map::Camel, x, z, floor, 0.28) {
+                return Vec3::new(x, y, z);
+            }
+        }
+        Vec3::new((area[0] + area[2]) * 0.5, floor, (area[1] + area[3]) * 0.5)
+    }
+
+    fn start_practice(&mut self, back: Screen) {
+        self.practice_back = back;
+        self.mode = Mode::Practice;
+        self.clear_match();
+        self.kill_target = map::WIN_SCORE;
+        self.self_id = Some(0);
+        self.team = Some(Team::Boys);
+        self.connected = true;
+        self.health = 3;
+        if self.username.trim().is_empty() {
+            self.username = "Komando".to_owned();
+        }
+        let spawn = self.spawn_point(Team::Boys);
+        self.position = Vec3::new(spawn.x, spawn.y + map::EYE_HEIGHT, spawn.z);
+        self.ground = self.position;
+        self.vertical = 0.0;
+        self.yaw = -std::f32::consts::FRAC_PI_2;
+        self.pitch = 0.0;
+        let bots = [
+            (1, "Kaptan", Team::Boys, 1),
+            (2, "Bozkurt", Team::Boys, 17),
+            (3, "Demir", Team::Boys, 11),
+            (4, "Aylin", Team::Girls, 9),
+            (5, "Zeynep", Team::Girls, 6),
+            (6, "Ece", Team::Girls, 13),
+            (7, "Defne", Team::Girls, 12),
+        ];
+        for (id, name, team, wp) in bots {
+            let pos = self.spawn_point(team);
+            let strafe = if id % 2 == 0 { 1.0 } else { -1.0 };
+            let delay = 800.0 + self.next_rand() as f64 * 1200.0;
+            self.remote.insert(
+                id,
+                RemotePlayer {
+                    name: name.to_owned(),
+                    x: pos.x,
+                    z: pos.z,
+                    y: pos.y,
+                    target: pos,
+                    yaw: if team == Team::Boys {
+                        -std::f32::consts::FRAC_PI_2
+                    } else {
+                        std::f32::consts::FRAC_PI_2
+                    },
+                    health: 3,
+                    team,
+                    kills: 0,
+                    deaths: 0,
+                    hit_at: f64::NEG_INFINITY,
+                    last_shot_at: f64::NEG_INFINITY,
+                    bot_wp: wp,
+                    bot_fire_at: self.last_frame + delay,
+                    bot_strafe: strafe,
+                    bot_respawn_at: f64::NEG_INFINITY,
+                },
+            );
+        }
+        self.lock_pointer();
+        self.show_screen(Screen::Playing);
+    }
+
+    fn respawn_practice_self(&mut self) {
+        let spawn = self.spawn_point(self.team.unwrap_or(Team::Boys));
+        self.position = Vec3::new(spawn.x, spawn.y + map::EYE_HEIGHT, spawn.z);
+        self.ground = self.position;
+        self.vertical = 0.0;
+        self.health = 3;
+        self.streak = 0;
+        self.shot_at = f64::NEG_INFINITY;
+        self.winner = None;
+        self.lock_pointer();
+        self.show_screen(Screen::Playing);
+    }
+
+    fn spawn_shot_vfx(&mut self, origin: Vec3, dir: Vec3, dist: f32, mine: bool, hit_wall: bool) {
+        let end = origin + dir * dist.min(95.0);
+        let start = if mine {
+            let right = Vec3::new(-dir.z, 0.0, dir.x).normalize_or_zero();
+            origin + dir * 0.75 + right * 0.06 - Vec3::Y * 0.16
+        } else {
+            origin + dir * 0.55 - Vec3::Y * 0.12
+        };
+        if self.tracers.len() >= 18 {
+            self.tracers.remove(0);
+        }
+        self.tracers.push(Tracer {
+            start,
+            end,
+            at: self.last_frame,
+            mine,
+        });
+        if hit_wall && dist < 90.0 {
+            let base = end - dir * 0.08;
+            for i in 0..5 {
+                let a = i as f32 * 1.26 + (self.last_frame as f32 * 0.01);
+                if self.sparks.len() >= 36 {
+                    self.sparks.remove(0);
+                }
+                self.sparks.push(Spark {
+                    position: base,
+                    velocity: Vec3::new(
+                        a.cos() * 2.2 - dir.x * 1.4,
+                        1.4 + (i % 3) as f32 * 0.7,
+                        a.sin() * 2.2 - dir.z * 1.4,
+                    ),
+                    at: self.last_frame,
+                });
+            }
+        }
+    }
+
+    fn register_local_kill(&mut self, victim_name: &str) {
+        self.streak += 1;
+        self.best_streak = self.best_streak.max(self.streak);
+        if self.last_frame - self.last_kill_at < 4500.0 {
+            self.multi_kill += 1;
+        } else {
+            self.multi_kill = 1;
+        }
+        self.last_kill_at = self.last_frame;
+        self.kill_hit_at = self.last_frame;
+        self.fov_kick = (self.fov_kick + 2.4).min(4.0);
+        web::sfx_hit(self.volume, true, self.multi_kill.max(self.streak));
+        let headline = match self.multi_kill {
+            2 => "ÇİFTE LEŞ!",
+            3 => "ÜÇLÜ LEŞ!",
+            4 => "DÖRTLÜ LEŞ!",
+            n if n >= 5 => "EFSANE SERİ!",
+            _ => match self.streak {
+                3 => "3 SERİ · KIZIŞTI!",
+                5 => "5 SERİ · DURDURULAMAZ!",
+                n if n >= 7 => "KRAL SERİ!",
+                _ => "+1 LEŞ",
+            },
+        };
+        self.kill_banner = Some((headline.to_owned(), victim_name.to_owned(), self.last_frame));
+    }
+
+    fn practice_fire_local(&mut self) {
+        let origin = self.position;
+        let dir = Vec3::new(
+            self.yaw.cos() * self.pitch.cos(),
+            self.pitch.sin(),
+            self.yaw.sin() * self.pitch.cos(),
+        );
+        let mut nearest = map::ray_map(origin.to_array(), dir.to_array());
+        let wall_dist = nearest;
+        let mut hit = None;
+        let my_team = self.team.unwrap_or(Team::Boys);
+        for (&id, p) in &self.remote {
+            if p.health == 0 || p.team == my_team {
+                continue;
+            }
+            if let Some(d) = map::ray_box(
+                origin.to_array(),
+                dir.to_array(),
+                [p.x - 0.38, p.y, p.z - 0.38],
+                [p.x + 0.38, p.y + 1.92, p.z + 0.38],
+            ) {
+                if d < nearest {
+                    nearest = d;
+                    hit = Some(id);
+                }
+            }
+        }
+        self.spawn_shot_vfx(
+            origin,
+            dir,
+            nearest,
+            true,
+            hit.is_none() && wall_dist < 95.0,
+        );
+        let Some(target_id) = hit else {
+            return;
+        };
+        self.hitmark_at = self.last_frame;
+        let mut killed = None;
+        if let Some(target) = self.remote.get_mut(&target_id) {
+            target.health = target.health.saturating_sub(1);
+            target.hit_at = self.last_frame;
+            let pos = Vec3::new(target.x, target.y + 1.15, target.z);
+            let dead = target.health == 0;
+            if dead {
+                target.deaths += 1;
+                target.bot_respawn_at = self.last_frame + 2600.0;
+                killed = Some((target.name.clone(), target.team));
+            }
+            if self.show_blood {
+                if self.blood.len() == 8 {
+                    self.blood.remove(0);
+                }
+                self.blood.push(BloodEffect {
+                    position: pos,
+                    at: self.last_frame,
+                    death: dead,
+                });
+            }
+        }
+        if let Some((victim_name, victim_team)) = killed {
+            self.kills += 1;
+            self.register_local_kill(&victim_name);
+            if self.kill_feed.len() == 5 {
+                self.kill_feed.remove(0);
+            }
+            self.kill_feed.push((
+                self.username.clone(),
+                victim_name,
+                my_team,
+                victim_team,
+                self.last_frame,
+            ));
+            let idx = usize::from(my_team == Team::Girls);
+            self.score[idx] += 1;
+            if self.score[idx] >= self.kill_target && self.winner.is_none() {
+                self.winner = Some(my_team);
+                self.result_deadline = self.last_frame + 8000.0;
+                web::sfx_end(self.volume, true);
+                self.show_screen(Screen::Result);
+            }
+        } else {
+            web::sfx_hit(self.volume, false, 0);
+        }
+    }
+
+    fn step_practice(&mut self, dt: f32, now: f64) {
+        if self.mode != Mode::Practice
+            || self.screen == Screen::Paused
+            || self.screen == Screen::Settings
+        {
+            return;
+        }
+        if self.winner.is_some() {
+            if now >= self.result_deadline {
+                let back = self.practice_back;
+                self.start_practice(back);
+            }
+            return;
+        }
+        let ids: Vec<u32> = self.remote.keys().copied().collect();
+        let my_team = self.team.unwrap_or(Team::Boys);
+        let my_pos = Vec3::new(
+            self.position.x,
+            self.position.y - map::EYE_HEIGHT,
+            self.position.z,
+        );
+        for id in ids {
+            let (team, alive, respawn_at) = {
+                let b = &self.remote[&id];
+                (b.team, b.health > 0, b.bot_respawn_at)
+            };
+            if !alive {
+                if now >= respawn_at {
+                    let spawn = self.spawn_point(team);
+                    let wp = if team == Team::Boys { 1 } else { 9 };
+                    if let Some(b) = self.remote.get_mut(&id) {
+                        (b.x, b.y, b.z) = (spawn.x, spawn.y, spawn.z);
+                        b.target = spawn;
+                        b.health = 3;
+                        b.bot_wp = wp;
+                        b.bot_fire_at = now + 1100.0;
+                    }
+                }
+                continue;
+            }
+            // Find nearest visible enemy (either player or opposing bot).
+            let (bx, by, bz, mut byaw, mut bwp, bstrafe, bfire) = {
+                let b = &self.remote[&id];
+                (b.x, b.y, b.z, b.yaw, b.bot_wp, b.bot_strafe, b.bot_fire_at)
+            };
+            let eye = Vec3::new(bx, by + 1.65, bz);
+            let mut best_target: Option<(Option<u32>, Vec3, f32)> = None;
+            if self.health > 0 && my_team != team {
+                let aim = Vec3::new(my_pos.x, my_pos.y + 1.25, my_pos.z);
+                let delta = aim - eye;
+                let dist = delta.length();
+                if dist > 0.5 && dist < 34.0 {
+                    let dir = delta / dist;
+                    if map::ray_map(eye.to_array(), dir.to_array()) > dist - 0.6 {
+                        best_target = Some((None, aim, dist));
+                    }
+                }
+            }
+            for (&other_id, other) in &self.remote {
+                if other_id == id || other.health == 0 || other.team == team {
+                    continue;
+                }
+                let aim = Vec3::new(other.x, other.y + 1.25, other.z);
+                let delta = aim - eye;
+                let dist = delta.length();
+                if dist > 0.5 && dist < 34.0 && best_target.is_none_or(|(_, _, d)| dist < d) {
+                    let dir = delta / dist;
+                    if map::ray_map(eye.to_array(), dir.to_array()) > dist - 0.6 {
+                        best_target = Some((Some(other_id), aim, dist));
+                    }
+                }
+            }
+
+            let mut nx = bx;
+            let mut ny = by;
+            let mut nz = bz;
+            let mut shot_event = None;
+            if let Some((target_opt, aim, dist)) = best_target {
+                let delta = aim - eye;
+                byaw = delta.z.atan2(delta.x);
+                let strafe_dir = Vec3::new(-delta.z, 0.0, delta.x).normalize_or_zero() * bstrafe;
+                let step = strafe_dir * 2.1 * dt;
+                let tx = bx + step.x;
+                let tz = bz + step.z;
+                if let Some(fl) = map::stand_height(Map::Camel, tx, tz, by, 0.28) {
+                    (nx, ny, nz) = (tx, fl, tz);
+                }
+                if now >= bfire {
+                    let spread_y = (self.next_rand() - 0.5) * 0.19;
+                    let spread_p = (self.next_rand() - 0.5) * 0.14;
+                    let pitch = (delta.y / dist).asin() + spread_p;
+                    let yaw = byaw + spread_y;
+                    let dir = Vec3::new(
+                        yaw.cos() * pitch.cos(),
+                        pitch.sin(),
+                        yaw.sin() * pitch.cos(),
+                    );
+                    let hit_ok = self.next_rand() < if target_opt.is_none() { 0.34 } else { 0.42 };
+                    let next_cd = 950.0 + self.next_rand() as f64 * 650.0;
+                    shot_event = Some((eye, dir, dist, target_opt, hit_ok, now + next_cd));
+                }
+            } else {
+                let (wp_pos, neighbors) = map::CAMEL_WAYPOINTS[bwp % map::CAMEL_WAYPOINTS.len()];
+                let dx = wp_pos[0] - bx;
+                let dz = wp_pos[1] - bz;
+                let d = dx.hypot(dz);
+                if d < 2.2 {
+                    let idx =
+                        (self.next_rand() * neighbors.len() as f32) as usize % neighbors.len();
+                    bwp = neighbors[idx];
+                } else {
+                    byaw = dz.atan2(dx);
+                    let speed = 3.35 * dt;
+                    let sx = dx / d * speed;
+                    let sz = dz / d * speed;
+                    if let Some(fl) = map::stand_height(Map::Camel, bx + sx, bz + sz, by, 0.28) {
+                        (nx, ny, nz) = (bx + sx, fl, bz + sz);
+                    } else if let Some(fl) = map::stand_height(Map::Camel, bx + sx, bz, by, 0.28) {
+                        (nx, ny) = (bx + sx, fl);
+                    } else if let Some(fl) = map::stand_height(Map::Camel, bx, bz + sz, by, 0.28) {
+                        (ny, nz) = (fl, bz + sz);
+                    } else {
+                        let idx =
+                            (self.next_rand() * neighbors.len() as f32) as usize % neighbors.len();
+                        bwp = neighbors[idx];
+                    }
+                }
+            }
+            if let Some(b) = self.remote.get_mut(&id) {
+                (b.x, b.y, b.z) = (nx, ny, nz);
+                b.target = Vec3::new(nx, ny, nz);
+                b.yaw = byaw;
+                b.bot_wp = bwp;
+                if let Some((_, _, _, _, _, next_at)) = shot_event {
+                    b.bot_fire_at = next_at;
+                    b.last_shot_at = now;
+                }
+            }
+            if let Some((origin, dir, dist, target_opt, hit_ok, _)) = shot_event {
+                let wall_d = map::ray_map(origin.to_array(), dir.to_array());
+                let tracer_d = if hit_ok { dist.min(wall_d) } else { wall_d };
+                self.spawn_shot_vfx(origin, dir, tracer_d, false, !hit_ok && wall_d < 95.0);
+                web::sfx_fire(self.volume, origin.distance(self.position));
+                if hit_ok {
+                    let killer_name = self.remote[&id].name.clone();
+                    match target_opt {
+                        None if self.health > 0 => {
+                            self.health -= 1;
+                            self.local_hit_at = now;
+                            self.damage_angle = Some((
+                                (origin.z - self.position.z).atan2(origin.x - self.position.x),
+                                now,
+                            ));
+                            web::sfx_hurt(self.volume);
+                            if self.health == 0 {
+                                self.deaths += 1;
+                                self.streak = 0;
+                                self.killed_by = Some(killer_name.clone());
+                                self.died_at = now;
+                                if let Some(k) = self.remote.get_mut(&id) {
+                                    k.kills += 1;
+                                }
+                                if self.kill_feed.len() == 5 {
+                                    self.kill_feed.remove(0);
+                                }
+                                self.kill_feed.push((
+                                    killer_name,
+                                    self.username.clone(),
+                                    team,
+                                    my_team,
+                                    now,
+                                ));
+                                let idx = usize::from(team == Team::Girls);
+                                self.score[idx] += 1;
+                                if self.score[idx] >= self.kill_target {
+                                    self.winner = Some(team);
+                                    self.result_deadline = now + 8000.0;
+                                    web::sfx_end(self.volume, false);
+                                    self.show_screen(Screen::Result);
+                                } else {
+                                    self.show_screen(Screen::Dead);
+                                }
+                            }
+                        }
+                        Some(vic_id) => {
+                            let mut dead_info = None;
+                            if let Some(vic) = self.remote.get_mut(&vic_id) {
+                                if vic.health > 0 {
+                                    vic.health -= 1;
+                                    vic.hit_at = now;
+                                    if vic.health == 0 {
+                                        vic.deaths += 1;
+                                        vic.bot_respawn_at = now + 2600.0;
+                                        dead_info = Some((
+                                            vic.name.clone(),
+                                            vic.team,
+                                            Vec3::new(vic.x, vic.y + 1.1, vic.z),
+                                        ));
+                                    }
+                                }
+                            }
+                            if let Some((vname, vteam, pos)) = dead_info {
+                                if let Some(k) = self.remote.get_mut(&id) {
+                                    k.kills += 1;
+                                }
+                                if self.show_blood {
+                                    if self.blood.len() == 8 {
+                                        self.blood.remove(0);
+                                    }
+                                    self.blood.push(BloodEffect {
+                                        position: pos,
+                                        at: now,
+                                        death: true,
+                                    });
+                                }
+                                if self.kill_feed.len() == 5 {
+                                    self.kill_feed.remove(0);
+                                }
+                                self.kill_feed.push((killer_name, vname, team, vteam, now));
+                                let idx = usize::from(team == Team::Girls);
+                                self.score[idx] += 1;
+                                if self.score[idx] >= self.kill_target && self.winner.is_none() {
+                                    self.winner = Some(team);
+                                    self.result_deadline = now + 8000.0;
+                                    web::sfx_end(self.volume, team == my_team);
+                                    self.show_screen(Screen::Result);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     fn logout(&mut self) {
@@ -811,7 +1487,7 @@ impl Game {
             (
                 i.key_pressed(Key::Escape),
                 i.key_pressed(Key::Space),
-                i.pointer.button_pressed(egui::PointerButton::Primary),
+                i.pointer.button_down(egui::PointerButton::Primary),
                 [Key::W, Key::A, Key::S, Key::D].map(|key| i.key_down(key)),
                 i.focused,
             )
@@ -833,13 +1509,27 @@ impl Game {
         let radians = minecraft_radians_per_count(self.sensitivity);
         self.yaw += delta.x * radians;
         self.pitch = (self.pitch - delta.y * radians).clamp(-1.5, 1.5);
+        self.weapon_sway = (self.weapon_sway + vec2(-delta.x * 0.00055, delta.y * 0.00045))
+            .clamp(vec2(-0.075, -0.055), vec2(0.075, 0.055));
         if !focused {
             self.show_screen(Screen::Paused);
             return;
         }
         if fire && self.health > 0 && self.last_frame - self.shot_at >= FIRE_COOLDOWN_MS {
             self.shot_at = self.last_frame;
-            if self.connected {
+            self.recoil_pitch = (self.recoil_pitch + 0.048).min(0.11);
+            self.fov_kick = (self.fov_kick + 1.4).min(3.5);
+            web::sfx_fire(self.volume, 0.0);
+            if self.mode == Mode::Practice {
+                self.practice_fire_local();
+            } else if self.connected {
+                let dir = Vec3::new(
+                    self.yaw.cos() * self.pitch.cos(),
+                    self.pitch.sin(),
+                    self.yaw.sin() * self.pitch.cos(),
+                );
+                let dist = map::ray_map(self.position.to_array(), dir.to_array());
+                self.spawn_shot_vfx(self.position, dir, dist, true, dist < 95.0);
                 self.send(format!("FIRE|{:.5}|{:.5}", self.yaw, self.pitch));
             }
         }
@@ -901,8 +1591,22 @@ impl Game {
         self.remote.clear();
         self.kill_feed.clear();
         self.blood.clear();
+        self.tracers.clear();
+        self.sparks.clear();
         self.kills = 0;
         self.deaths = 0;
+        self.streak = 0;
+        self.best_streak = 0;
+        self.multi_kill = 0;
+        self.last_kill_at = f64::NEG_INFINITY;
+        self.kill_hit_at = f64::NEG_INFINITY;
+        self.kill_banner = None;
+        self.damage_angle = None;
+        self.last_countdown_sec = 0;
+        self.recoil_pitch = 0.0;
+        self.strafe_roll = 0.0;
+        self.fov_kick = 0.0;
+        self.weapon_sway = Vec2::ZERO;
         self.winner = None;
         self.score = [0, 0];
         self.team = None;
@@ -913,7 +1617,7 @@ impl Game {
         self.local_hit_at = f64::NEG_INFINITY;
         self.yaw = -std::f32::consts::FRAC_PI_2;
         self.pitch = 0.0;
-        if self.mode == Mode::Deathmatch {
+        if self.mode != Mode::Ranked {
             self.kill_target = map::WIN_SCORE;
         }
     }
@@ -1052,6 +1756,7 @@ impl Game {
             }
             Some("GO") => {
                 self.ranked_started = true;
+                web::sfx_tick(self.volume, true);
                 if self.screen == Screen::MatchIntro && self.grabbed {
                     self.show_screen(Screen::Playing);
                 }
@@ -1075,6 +1780,7 @@ impl Game {
                     a.wins = wins;
                     a.losses = losses;
                 }
+                web::sfx_end(self.volume, fields[0] == "win");
                 self.ranked_result = Some(RankedResult {
                     result: fields[0].to_owned(),
                     reason: fields[1].to_owned(),
@@ -1091,6 +1797,29 @@ impl Game {
             }
             Some("HITMARK") => {
                 self.hitmark_at = self.last_frame;
+                web::sfx_hit(self.volume, false, 0);
+            }
+            Some("SHOT") => {
+                let (Some(Ok(id)), Some(Ok(yaw)), Some(Ok(pitch))) = (
+                    parts.next().map(str::parse::<u32>),
+                    parts.next().map(str::parse::<f32>),
+                    parts.next().map(str::parse::<f32>),
+                ) else {
+                    return;
+                };
+                if let Some(player) = self.remote.get_mut(&id) {
+                    player.last_shot_at = self.last_frame;
+                    let origin = Vec3::new(player.x, player.y + 1.65, player.z);
+                    let dir = Vec3::new(
+                        yaw.cos() * pitch.cos(),
+                        pitch.sin(),
+                        yaw.sin() * pitch.cos(),
+                    );
+                    let dist = map::ray_map(origin.to_array(), dir.to_array());
+                    let listener_dist = origin.distance(self.position);
+                    self.spawn_shot_vfx(origin, dir, dist, false, dist < 95.0);
+                    web::sfx_fire(self.volume, listener_dist);
+                }
             }
             Some("KILL") => {
                 let (Some(Ok(killer)), Some(Ok(victim))) = (
@@ -1103,11 +1832,13 @@ impl Game {
                 let (victim_name, victim_team) = self.player_label(victim);
                 if self.self_id == Some(killer) {
                     self.kills += 1;
+                    self.register_local_kill(&victim_name);
                 } else if let Some(p) = self.remote.get_mut(&killer) {
                     p.kills += 1;
                 }
                 if self.self_id == Some(victim) {
                     self.deaths += 1;
+                    self.streak = 0;
                     self.killed_by = Some(killer_name.clone());
                 } else if let Some(p) = self.remote.get_mut(&victim) {
                     p.deaths += 1;
@@ -1190,6 +1921,7 @@ impl Game {
                     } else {
                         Team::Boys
                     });
+                    web::sfx_end(self.volume, self.team == self.winner);
                     self.result_deadline = self.last_frame + remaining * 1000.0;
                     self.show_screen(Screen::Result);
                 }
@@ -1270,6 +2002,12 @@ impl Game {
                             } else {
                                 Team::Boys
                             },
+                            hit_at: f64::NEG_INFINITY,
+                            last_shot_at: f64::NEG_INFINITY,
+                            bot_wp: 0,
+                            bot_fire_at: f64::NEG_INFINITY,
+                            bot_strafe: 1.0,
+                            bot_respawn_at: f64::NEG_INFINITY,
                         },
                     );
                 }
@@ -1326,18 +2064,38 @@ impl Game {
                                 self.position.y - 0.6,
                                 self.position.z,
                             ));
+                            web::sfx_hurt(self.volume);
+                            // Point damage arc toward the enemy who fired most recently.
+                            if let Some(shooter) = self
+                                .remote
+                                .values()
+                                .filter(|p| {
+                                    p.health > 0
+                                        && Some(p.team) != self.team
+                                        && self.last_frame - p.last_shot_at < 600.0
+                                })
+                                .max_by(|a, b| a.last_shot_at.total_cmp(&b.last_shot_at))
+                            {
+                                self.damage_angle = Some((
+                                    (shooter.z - self.position.z)
+                                        .atan2(shooter.x - self.position.x),
+                                    self.last_frame,
+                                ));
+                            }
                             if self.show_blood {
                                 self.local_hit_at = self.last_frame;
                             }
                         }
                         self.health = health;
                         if health == 0 && self.winner.is_none() {
+                            self.streak = 0;
                             self.died_at = self.last_frame;
                             self.show_screen(Screen::Dead);
                         }
                     } else if let Some(player) = self.remote.get_mut(&id) {
                         if health < player.health {
                             hit_position = Some(Vec3::new(player.x, player.y + 1.1, player.z));
+                            player.hit_at = self.last_frame;
                         }
                         player.health = health;
                     }
@@ -1371,10 +2129,14 @@ impl Game {
     fn draw(&mut self, now: f64, [width, height]: [u32; 2]) -> bool {
         let dt = ((now - self.last_draw) / 1000.0).clamp(0.0, 0.05) as f32;
         self.last_frame = now;
-        let blend = (dt * 15.0).min(1.0);
-        for player in self.remote.values_mut() {
-            let eased = Vec3::new(player.x, player.y, player.z).lerp(player.target, blend);
-            (player.x, player.y, player.z) = (eased.x, eased.y, eased.z);
+        if self.mode == Mode::Practice {
+            self.step_practice(dt, now);
+        } else {
+            let blend = (dt * 15.0).min(1.0);
+            for player in self.remote.values_mut() {
+                let eased = Vec3::new(player.x, player.y, player.z).lerp(player.target, blend);
+                (player.x, player.y, player.z) = (eased.x, eased.y, eased.z);
+            }
         }
         let backdrop = matches!(
             self.screen,
@@ -1399,11 +2161,15 @@ impl Game {
         self.fps_frames += 1;
         let forward = Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin());
         let right = Vec3::new(-forward.z, 0.0, forward.x);
-        let movement = forward * (self.keys[0] as i32 - self.keys[2] as i32) as f32
-            + right * (self.keys[3] as i32 - self.keys[1] as i32) as f32;
+        let strafe_input = (self.keys[3] as i32 - self.keys[1] as i32) as f32;
+        let movement =
+            forward * (self.keys[0] as i32 - self.keys[2] as i32) as f32 + right * strafe_input;
+        let mut moved_dist = 0.0_f32;
         if self.screen == Screen::Playing && self.health > 0 {
             let radius = 0.28;
             let feet = self.position.y - map::EYE_HEIGHT;
+            let before_x = self.position.x;
+            let before_z = self.position.z;
             if movement.length_squared() > 0.0 {
                 let step = movement.normalize() * 4.0 * dt;
                 // Landing or stepping down beside a wall can leave the body inside
@@ -1425,6 +2191,7 @@ impl Game {
                     }
                 }
             }
+            moved_dist = (self.position.x - before_x).hypot(self.position.z - before_z);
             let feet = self.position.y - map::EYE_HEIGHT;
             if self.vertical == 0.0 {
                 if let Some(floor) = map::floor_at(
@@ -1442,6 +2209,7 @@ impl Game {
             if self.jump {
                 if self.vertical == 0.0 {
                     self.vertical = JUMP_SPEED;
+                    self.was_airborne = true;
                 }
                 self.jump = false;
             }
@@ -1456,11 +2224,24 @@ impl Game {
                 map::STEP_UP,
             );
             if let Some(floor) = floor.filter(|floor| landing <= *floor) {
+                if self.was_airborne && self.vertical < -3.0 {
+                    self.land_dip = (self.vertical.abs() * 0.012).min(0.09);
+                    web::sfx_step(self.volume, true);
+                }
+                self.was_airborne = false;
                 self.position.y = floor + map::EYE_HEIGHT;
                 self.vertical = 0.0;
                 self.ground = self.position;
             } else {
+                self.was_airborne = true;
                 self.position.y += self.vertical * dt;
+            }
+            if !self.was_airborne && moved_dist > 0.001 {
+                self.step_dist += moved_dist;
+                if self.step_dist >= 1.85 {
+                    self.step_dist = 0.0;
+                    web::sfx_step(self.volume, false);
+                }
             }
             // Back to the last floor, which the server also knows, not a fixed spawn.
             if self.position.y < FALL_LIMIT {
@@ -1468,7 +2249,30 @@ impl Game {
                 self.vertical = 0.0;
             }
         }
-        if self.screen == Screen::Playing && self.connected && now - self.last_sent >= 31.25 {
+        // Smooth camera and weapon feel damping.
+        let damp = (-dt * 12.0).exp();
+        self.recoil_pitch *= damp;
+        self.fov_kick *= (-dt * 10.0).exp();
+        self.weapon_sway *= (-dt * 11.0).exp();
+        self.land_dip *= (-dt * 13.0).exp();
+        let target_roll = if self.screen == Screen::Playing && self.health > 0 {
+            -strafe_input * 0.022
+        } else {
+            0.0
+        };
+        self.strafe_roll += (target_roll - self.strafe_roll) * (dt * 10.0).min(1.0);
+        let moving_ground = !self.was_airborne && moved_dist > 0.002;
+        let target_bob = if moving_ground { 1.0 } else { 0.0 };
+        self.bob_amount += (target_bob - self.bob_amount) * (dt * 10.0).min(1.0);
+        if moving_ground {
+            self.bob_phase += dt * 10.5;
+        }
+
+        if self.screen == Screen::Playing
+            && self.mode != Mode::Practice
+            && self.connected
+            && now - self.last_sent >= 31.25
+        {
             self.send(format!(
                 "POS|{:.3}|{:.3}|{:.3}|{:.3}",
                 self.position.x,
@@ -1479,26 +2283,56 @@ impl Game {
             self.last_sent = now;
         }
 
-        let direction = Vec3::new(
-            self.yaw.cos() * self.pitch.cos(),
-            self.pitch.sin(),
-            self.yaw.sin() * self.pitch.cos(),
-        );
-        let projection = camera::rh::proj::opengl::perspective(
-            70.0_f32.to_radians(),
-            width as f32 / height as f32,
-            0.1,
-            100.0,
-        );
-        let view = if backdrop {
-            let angle = now as f32 * 0.00005;
-            let center = Vec3::new(0.0, 0.0, 0.0);
-            let eye = center + Vec3::new(angle.cos() * 35.0, 18.0, angle.sin() * 35.0);
-            camera::rh::view::look_to_mat4(eye, (center - eye).normalize(), Vec3::Y)
+        let aspect = width as f32 / height as f32;
+        let fov_rad = (70.0 + self.fov_kick).to_radians();
+        let projection = camera::rh::proj::opengl::perspective(fov_rad, aspect, 0.1, 130.0);
+        let (cam_pos, cam_fwd, cam_up) = if backdrop {
+            let angle = now as f32 * 0.000085;
+            let center = Vec3::new(4.0, 3.8, -3.0);
+            let eye = center
+                + Vec3::new(
+                    angle.cos() * 21.0,
+                    9.5 + (angle * 1.7).sin() * 2.0,
+                    angle.sin() * 24.0,
+                );
+            (eye, (center - eye).normalize(), Vec3::Y)
         } else {
-            camera::rh::view::look_to_mat4(self.position, direction, Vec3::Y)
+            let hurt_shake = if now - self.local_hit_at < 180.0 {
+                let t = (1.0 - (now - self.local_hit_at) as f32 / 180.0).clamp(0.0, 1.0);
+                (
+                    (now as f32 * 0.07).sin() * 0.018 * t,
+                    (now as f32 * 0.09).cos() * 0.014 * t,
+                )
+            } else {
+                (0.0, 0.0)
+            };
+            let vp_pitch = (self.pitch + self.recoil_pitch + hurt_shake.1).clamp(-1.54, 1.54);
+            let fwd = Vec3::new(
+                self.yaw.cos() * vp_pitch.cos(),
+                vp_pitch.sin(),
+                self.yaw.sin() * vp_pitch.cos(),
+            )
+            .normalize();
+            let base_right = fwd.cross(Vec3::Y).normalize_or_zero();
+            let base_up = base_right.cross(fwd).normalize_or_zero();
+            let roll = self.strafe_roll + hurt_shake.0;
+            let rolled_up = (base_up * roll.cos() + base_right * roll.sin()).normalize();
+            let eye = self.position - Vec3::Y * (self.land_dip * 0.85);
+            (eye, fwd, rolled_up)
         };
+        let cam_right = cam_fwd.cross(cam_up).normalize_or_zero();
+        let cam_up_ortho = cam_right.cross(cam_fwd).normalize_or_zero();
+        let view = camera::rh::view::look_to_mat4(cam_pos, cam_fwd, cam_up_ortho);
         let vp = projection * view;
+        self.last_vp = vp;
+
+        let muzzle_age = ((now - self.shot_at) / 110.0) as f32;
+        let muzzle_light = if !backdrop && (0.0..1.0).contains(&muzzle_age) {
+            (1.0 - muzzle_age) * 1.35
+        } else {
+            0.0
+        };
+        let muzzle_pos = cam_pos + cam_fwd * 1.1;
 
         let gl = &self.gl;
         unsafe {
@@ -1551,12 +2385,45 @@ impl Game {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.framebuffer));
             gl.viewport(0, 0, width as i32, height as i32);
             gl.disable(glow::SCISSOR_TEST);
-            gl.clear_color(0.58, 0.77, 0.93, 1.0);
+            gl.clear_color(0.89, 0.79, 0.65, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+
+            // Golden desert sky gradient & sun disc.
+            gl.disable(glow::DEPTH_TEST);
+            gl.depth_mask(false);
+            gl.use_program(Some(self.sky_program));
+            gl.uniform_3_f32(Some(&self.sky_fwd_loc), cam_fwd.x, cam_fwd.y, cam_fwd.z);
+            gl.uniform_3_f32(
+                Some(&self.sky_right_loc),
+                cam_right.x,
+                cam_right.y,
+                cam_right.z,
+            );
+            gl.uniform_3_f32(
+                Some(&self.sky_up_loc),
+                cam_up_ortho.x,
+                cam_up_ortho.y,
+                cam_up_ortho.z,
+            );
+            gl.uniform_1_f32(Some(&self.sky_aspect_loc), aspect);
+            gl.uniform_1_f32(Some(&self.sky_fov_loc), (fov_rad * 0.5).tan());
+            gl.bind_vertex_array(Some(self.sprite_vao));
+            gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            gl.depth_mask(true);
             gl.enable(glow::DEPTH_TEST);
+
             gl.use_program(Some(self.program));
             gl.active_texture(glow::TEXTURE0);
+            gl.uniform_3_f32(Some(&self.cam_pos_loc), cam_pos.x, cam_pos.y, cam_pos.z);
+            gl.uniform_3_f32(
+                Some(&self.muzzle_pos_loc),
+                muzzle_pos.x,
+                muzzle_pos.y,
+                muzzle_pos.z,
+            );
+            gl.uniform_1_f32(Some(&self.muzzle_light_loc), muzzle_light);
             gl.uniform_1_i32(Some(&self.texture_enabled), 0);
+            gl.uniform_1_i32(Some(&self.unlit_loc), 0);
             gl.bind_vertex_array(Some(self.vao));
             for block in map::blocks(self.map) {
                 let position = Vec3::from_array(block.center);
@@ -1567,16 +2434,23 @@ impl Game {
                     false,
                     &(vp * model).to_cols_array(),
                 );
+                gl.uniform_matrix_4_f32_slice(Some(&self.model_loc), false, &model.to_cols_array());
                 gl.vertex_attrib_4_f32(3, block.color[0], block.color[1], block.color[2], 1.0);
                 gl.draw_elements(glow::TRIANGLES, 36, glow::UNSIGNED_SHORT, 0);
             }
             if self.map == Map::Camel {
                 gl.bind_vertex_array(Some(self.camel_vao));
-                let camel_vp = vp * Mat4::from_scale(Vec3::splat(map::CAMEL_SCALE));
+                let camel_model = Mat4::from_scale(Vec3::splat(map::CAMEL_SCALE));
+                let camel_vp = vp * camel_model;
                 gl.uniform_matrix_4_f32_slice(
                     Some(&self.transform),
                     false,
                     &camel_vp.to_cols_array(),
+                );
+                gl.uniform_matrix_4_f32_slice(
+                    Some(&self.model_loc),
+                    false,
+                    &camel_model.to_cols_array(),
                 );
                 gl.uniform_1_i32(Some(&self.texture_enabled), 1);
                 gl.vertex_attrib_4_f32(3, 1.0, 1.0, 1.0, 1.0);
@@ -1587,6 +2461,7 @@ impl Game {
                 gl.bind_vertex_array(Some(self.vao));
             }
             gl.uniform_1_i32(Some(&self.texture_enabled), 0);
+            gl.uniform_1_i32(Some(&self.unlit_loc), 1);
             self.blood
                 .retain(|effect| now - effect.at < if effect.death { 800.0 } else { 420.0 });
             if self.show_blood {
@@ -1614,6 +2489,11 @@ impl Game {
                             false,
                             &(vp * model).to_cols_array(),
                         );
+                        gl.uniform_matrix_4_f32_slice(
+                            Some(&self.model_loc),
+                            false,
+                            &model.to_cols_array(),
+                        );
                         gl.vertex_attrib_4_f32(
                             3,
                             0.55 + (index % 3) as f32 * 0.1,
@@ -1626,6 +2506,56 @@ impl Game {
                 }
             }
 
+            // Wall impact dust & sparks + glowing 3D bullet tracers.
+            self.sparks.retain(|s| now - s.at < 320.0);
+            self.tracers.retain(|t| now - t.at < 140.0);
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            gl.depth_mask(false);
+            for spark in &self.sparks {
+                let age = ((now - spark.at) / 1000.0).max(0.0) as f32;
+                let alpha = (1.0 - age / 0.32).clamp(0.0, 1.0);
+                let pos = spark.position + spark.velocity * age - Vec3::Y * (4.5 * age * age);
+                let model = Mat4::from_translation(pos)
+                    * Mat4::from_scale(Vec3::splat(0.045 * alpha.max(0.3)));
+                gl.uniform_matrix_4_f32_slice(
+                    Some(&self.transform),
+                    false,
+                    &(vp * model).to_cols_array(),
+                );
+                gl.uniform_matrix_4_f32_slice(Some(&self.model_loc), false, &model.to_cols_array());
+                gl.vertex_attrib_4_f32(3, 1.0, 0.78, 0.38, alpha * 0.9);
+                gl.draw_elements(glow::TRIANGLES, 36, glow::UNSIGNED_SHORT, 0);
+            }
+            for tracer in &self.tracers {
+                let age = ((now - tracer.at) / 140.0).clamp(0.0, 1.0) as f32;
+                let delta = tracer.end - tracer.start;
+                let len = delta.length();
+                if len < 0.2 {
+                    continue;
+                }
+                let dir = delta / len;
+                let up_ref = if dir.y.abs() > 0.95 { Vec3::X } else { Vec3::Y };
+                let tr = dir.cross(up_ref).normalize();
+                let tu = tr.cross(dir).normalize();
+                let thick = if tracer.mine { 0.016 } else { 0.022 } * (1.0 - age * 0.5);
+                let mid = (tracer.start + tracer.end) * 0.5;
+                let model = Mat4::from_cols(
+                    (tr * thick).extend(0.0),
+                    (tu * thick).extend(0.0),
+                    (dir * (len * 0.5)).extend(0.0),
+                    mid.extend(1.0),
+                );
+                gl.uniform_matrix_4_f32_slice(
+                    Some(&self.transform),
+                    false,
+                    &(vp * model).to_cols_array(),
+                );
+                gl.uniform_matrix_4_f32_slice(Some(&self.model_loc), false, &model.to_cols_array());
+                gl.vertex_attrib_4_f32(3, 1.0, 0.82, 0.32, (1.0 - age) * 0.85);
+                gl.draw_elements(glow::TRIANGLES, 36, glow::UNSIGNED_SHORT, 0);
+            }
+
             let mut players = self
                 .remote
                 .values()
@@ -1636,9 +2566,20 @@ impl Game {
                 let db = (b.x - self.position.x).powi(2) + (b.z - self.position.z).powi(2);
                 db.total_cmp(&da)
             });
-            gl.depth_mask(false);
-            gl.enable(glow::BLEND);
-            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            // Soft contact shadows under players so sprites feel planted on the desert floor.
+            for player in &players {
+                let model = Mat4::from_translation(Vec3::new(player.x, player.y + 0.03, player.z))
+                    * Mat4::from_scale(Vec3::new(0.42, 0.01, 0.42));
+                gl.uniform_matrix_4_f32_slice(
+                    Some(&self.transform),
+                    false,
+                    &(vp * model).to_cols_array(),
+                );
+                gl.uniform_matrix_4_f32_slice(Some(&self.model_loc), false, &model.to_cols_array());
+                gl.vertex_attrib_4_f32(3, 0.05, 0.04, 0.03, 0.42);
+                gl.draw_elements(glow::TRIANGLES, 36, glow::UNSIGNED_SHORT, 0);
+            }
+
             gl.use_program(Some(self.sprite_program));
             for player in players {
                 let (texture, vaos, views) = match player.team {
@@ -1649,13 +2590,30 @@ impl Game {
                     ),
                     Team::Girls => (self.girl_texture, &self.girl_vaos, &GIRL_VIEWS),
                 };
-                let view_index = operative_view(player, self.position);
+                let view_index = operative_view(player, cam_pos);
                 let crop = views[view_index];
                 let half_width = 0.95 * (crop[2] - crop[0]) / (crop[3] - crop[1]);
-                let facing_viewer = (self.position.x - player.x).atan2(self.position.z - player.z);
+                let facing_viewer = (cam_pos.x - player.x).atan2(cam_pos.z - player.z);
                 let model = Mat4::from_translation(Vec3::new(player.x, player.y + 0.95, player.z))
                     * Mat4::from_rotation_y(facing_viewer)
                     * Mat4::from_scale(Vec3::new(half_width, 0.95, 1.0));
+                let dist = Vec3::new(player.x, player.y + 1.0, player.z).distance(cam_pos);
+                let fog = ((dist - 24.0) / 76.0).clamp(0.0, 0.48);
+                let hit_fade = ((135.0 - (now - player.hit_at)) / 135.0).clamp(0.0, 1.0) as f32;
+                let shot_glow =
+                    ((90.0 - (now - player.last_shot_at)) / 90.0).clamp(0.0, 1.0) as f32;
+                gl.uniform_4_f32(
+                    Some(&self.sprite_tint),
+                    1.02 + shot_glow * 0.25,
+                    0.98 + shot_glow * 0.12,
+                    0.92,
+                    1.0,
+                );
+                if hit_fade > 0.01 {
+                    gl.uniform_4_f32(Some(&self.sprite_flash), 1.0, 0.45, 0.30, hit_fade * 0.72);
+                } else {
+                    gl.uniform_4_f32(Some(&self.sprite_flash), 0.89, 0.79, 0.65, fog * 0.55);
+                }
                 gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                 gl.bind_vertex_array(Some(vaos[view_index]));
                 gl.uniform_matrix_4_f32_slice(
@@ -1669,52 +2627,45 @@ impl Game {
             gl.depth_mask(true);
 
             gl.disable(glow::DEPTH_TEST);
-            if self.show_blood && now - self.local_hit_at < 350.0 {
-                let fade = (1.0 - (now - self.local_hit_at) as f32 / 350.0).clamp(0.0, 1.0);
-                gl.enable(glow::BLEND);
-                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
-                gl.use_program(Some(self.program));
-                gl.bind_vertex_array(Some(self.vao));
-                for (x, y, size) in [
-                    (-0.91, 0.55, 0.09),
-                    (-0.88, -0.55, 0.06),
-                    (0.92, 0.35, 0.08),
-                    (0.84, -0.72, 0.07),
-                ] {
-                    let size = size * if self.health == 0 { 1.8 } else { 1.0 };
-                    let model = Mat4::from_translation(Vec3::new(x, y, 0.0))
-                        * Mat4::from_scale(Vec3::new(size, size * 1.4, 0.01));
-                    gl.uniform_matrix_4_f32_slice(
-                        Some(&self.transform),
-                        false,
-                        &model.to_cols_array(),
-                    );
-                    gl.vertex_attrib_4_f32(3, 0.7, 0.0, 0.02, fade * 0.6);
-                    gl.draw_elements(glow::TRIANGLES, 36, glow::UNSIGNED_SHORT, 0);
-                }
-                gl.disable(glow::BLEND);
-            }
             if !backdrop {
-                let frame = if now - self.shot_at < 120.0 {
+                let since_shot = now - self.shot_at;
+                let frame = if since_shot < 95.0 {
                     1
-                } else if now - self.shot_at < 240.0 {
+                } else if since_shot < 210.0 {
                     2
                 } else {
                     0
                 };
-                let (aspect, sight_x) = match frame {
+                let (aspect_w, sight_x) = match frame {
                     0 => (1.5, 768.0 / 1536.0),
                     1 => (1.0, 630.0 / 1254.0),
                     _ => (1.0, 665.0 / 1254.0),
                 };
-                let sy = [0.65, 0.69, 0.66][frame];
-                let sx = sy * aspect * height as f32 / width as f32;
-                let weapon =
-                    Mat4::from_translation(Vec3::new((0.5 - sight_x) * 2.0 * sx, -1.0 + sy, 0.0))
-                        * Mat4::from_scale(Vec3::new(sx, sy, 1.0));
+                let kick = if (0.0..260.0).contains(&since_shot) {
+                    (1.0 - (since_shot as f32 / 260.0)).powi(2)
+                } else {
+                    0.0
+                };
+                let bob_x = self.bob_phase.cos() * 0.024 * self.bob_amount;
+                let bob_y = (self.bob_phase * 2.0).sin().abs() * -0.022 * self.bob_amount;
+                let sy = [0.65, 0.69, 0.66][frame] * (1.0 + kick * 0.04);
+                let sx = sy * aspect_w * height as f32 / width as f32;
+                let tx = (0.5 - sight_x) * 2.0 * sx + bob_x + self.weapon_sway.x;
+                let ty = -1.0 + sy + bob_y + self.weapon_sway.y - self.land_dip * 0.8 - kick * 0.06;
+                let weapon = Mat4::from_translation(Vec3::new(tx, ty, 0.0))
+                    * Mat4::from_rotation_z(-self.weapon_sway.x * 0.55 + kick * 0.03)
+                    * Mat4::from_scale(Vec3::new(sx, sy, 1.0));
                 gl.enable(glow::BLEND);
                 gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
                 gl.use_program(Some(self.sprite_program));
+                gl.uniform_4_f32(
+                    Some(&self.sprite_tint),
+                    1.0 + muzzle_light * 0.14,
+                    0.99 + muzzle_light * 0.06,
+                    0.96,
+                    1.0,
+                );
+                gl.uniform_4_f32(Some(&self.sprite_flash), 0.0, 0.0, 0.0, 0.0);
                 gl.bind_vertex_array(Some(self.sprite_vao));
                 gl.bind_texture(glow::TEXTURE_2D, Some(self.textures[frame]));
                 gl.uniform_matrix_4_f32_slice(
@@ -1743,7 +2694,7 @@ impl Game {
         }
     }
 
-    fn settings_values(&self) -> [String; 7] {
+    fn settings_values(&self) -> [String; 10] {
         [
             self.sensitivity.to_string(),
             self.hud_scale.to_string(),
@@ -1757,6 +2708,9 @@ impl Game {
                 "{},{},{}",
                 self.crosshair.0, self.crosshair.1, self.crosshair.2
             ),
+            self.volume.to_string(),
+            self.dynamic_crosshair.to_string(),
+            self.show_radar.to_string(),
         ]
     }
 
@@ -1769,6 +2723,9 @@ impl Game {
             "resolution",
             "fps_limit",
             "crosshair",
+            "volume",
+            "dynamic_crosshair",
+            "show_radar",
         ]
         .into_iter()
         .zip(self.settings_values())
@@ -1789,11 +2746,20 @@ impl Game {
         if let Some(v) = number("hud_scale") {
             self.hud_scale = v.clamp(50.0, 200.0);
         }
+        if let Some(v) = number("volume") {
+            self.volume = v.clamp(0.0, 100.0);
+        }
         if let Some(v) = web::storage_get("keles.show_fps").and_then(|v| v.parse().ok()) {
             self.show_fps = v;
         }
         if let Some(v) = web::storage_get("keles.show_blood").and_then(|v| v.parse().ok()) {
             self.show_blood = v;
+        }
+        if let Some(v) = web::storage_get("keles.dynamic_crosshair").and_then(|v| v.parse().ok()) {
+            self.dynamic_crosshair = v;
+        }
+        if let Some(v) = web::storage_get("keles.show_radar").and_then(|v| v.parse().ok()) {
+            self.show_radar = v;
         }
         if let Some(v) = web::storage_get("keles.fps_limit")
             .and_then(|v| v.parse::<u32>().ok())
@@ -1882,6 +2848,13 @@ impl eframe::App for Game {
             self.send("INFO".to_owned());
             self.last_info = now;
         }
+        if self.screen == Screen::MatchIntro && !self.ranked_started {
+            let sec = ((self.go_at - now) / 1000.0).ceil().max(0.0) as u32;
+            if sec > 0 && sec != self.last_countdown_sec {
+                self.last_countdown_sec = sec;
+                web::sfx_tick(self.volume, false);
+            }
+        }
         if self.screen == Screen::MatchIntro && self.ranked_started && self.grabbed {
             self.show_screen(Screen::Playing);
         }
@@ -1931,7 +2904,11 @@ impl eframe::App for Game {
                 gl.disable(glow::BLEND);
                 gl.use_program(Some(program));
                 let transform = gl.get_uniform_location(program, "MVP");
+                let tint = gl.get_uniform_location(program, "tint");
+                let flash = gl.get_uniform_location(program, "flash");
                 gl.uniform_matrix_4_f32_slice(transform.as_ref(), false, &flip);
+                gl.uniform_4_f32(tint.as_ref(), 1.0, 1.0, 1.0, 1.0);
+                gl.uniform_4_f32(flash.as_ref(), 0.0, 0.0, 0.0, 0.0);
                 gl.bind_vertex_array(Some(vao));
                 gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                 gl.draw_arrays(glow::TRIANGLES, 0, 6);
