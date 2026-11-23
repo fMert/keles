@@ -72,8 +72,6 @@ unless the owner explicitly changes them.
   `dist/web/`. Build server changes with
   `cargo build --release --locked --manifest-path server/Cargo.toml`.
   Do not produce desktop graphical clients or `.exe`/`.deb` packages.
-  Work locally only: no VPS, SSH, remote commands, uploads, deployment, or
-  domain/DNS/TLS/proxy/service administration. Local development servers are allowed.
 - For the original first deliverable, the required files were Cargo and
   wasm-pack configuration, the HTML loader, and Rust code for camera
   position/yaw/pitch, WASD and mouse look, ground and 3–5 boxes, a bottom-center
