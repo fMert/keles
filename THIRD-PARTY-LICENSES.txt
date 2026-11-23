@@ -1,9 +1,10 @@
 Keles asset and source credits
 
-DE_KERVAN: original 3D map and procedural textures authored for Keles
-(GPL-3.0-or-later). Source asset is assets/kervan_original.glb; tools/convert
-extracts its binary mesh, draw manifest, and PNG textures.
-Character turnarounds, logo and weapon images: supplied by the project owner.
+DE_KERVAN map, articulated 3D male & female operative characters, and 3D AK-47
+first-person viewmodel: original 3D models and procedural textures authored for
+Keles (GPL-3.0-or-later), extracted by tools/convert from assets/kervan_original.glb,
+assets/operative_male.glb, assets/operative_female.glb, and assets/weapon_viewmodel.glb.
+Logo image: supplied by the project owner.
 DejaVu Sans: https://github.com/dejavu-fonts/dejavu-fonts, Bitstream Vera license
 with public-domain DejaVu changes (see DejaVu-LICENSE.txt). A long-established
 font project distributed by Debian and previously used by this game's desktop client.

@@ -11,7 +11,7 @@ use eframe::{
     glow::{self, HasContext},
 };
 use ewebsock::{WsEvent, WsMessage};
-use glam::{camera, Mat4, Vec3};
+use glam::{camera, Mat4, Quat, Vec3};
 // Shared with the server; each side uses only part of it.
 #[allow(dead_code)]
 mod map;
@@ -148,23 +148,27 @@ mod tests {
 // License: MIT (see LICENSE-MIT-WebGL2Samples).
 const VERTEX_SHADER: &str = r#"#version 300 es
 #define POSITION_LOCATION 0
+#define NORMAL_LOCATION 1
 #define COLOR_POSITION 3
 precision highp float;
 precision highp int;
 uniform mat4 MVP;
 uniform mat4 MODEL;
 layout(location = POSITION_LOCATION) in vec4 position;
+layout(location = NORMAL_LOCATION) in vec3 normal;
 layout(location = COLOR_POSITION) in vec4 color;
 layout(location = 4) in vec2 texcoord;
 out vec4 v_color;
 out vec2 v_uv;
 out vec3 v_world;
+out vec3 v_normal;
 void main()
 {
     gl_Position = MVP * position;
     v_color = color;
     v_uv = texcoord;
     v_world = (MODEL * position).xyz;
+    v_normal = mat3(MODEL) * normal;
 }
 "#;
 const FRAGMENT_SHADER: &str = r#"#version 300 es
@@ -173,9 +177,13 @@ precision highp int;
 in vec4 v_color;
 in vec2 v_uv;
 in vec3 v_world;
+in vec3 v_normal;
 uniform sampler2D diffuse;
 uniform bool use_texture;
+uniform bool use_vertex_normal;
 uniform bool unlit;
+uniform bool no_fog;
+uniform vec4 hit_flash;
 uniform vec3 cam_pos;
 uniform vec3 muzzle_pos;
 uniform float muzzle_light;
@@ -185,23 +193,35 @@ void main()
     vec4 base = v_color;
     if (use_texture) base.rgb *= texture(diffuse, v_uv).rgb;
     if (unlit) {
-        color = base;
+        color = vec4(mix(base.rgb, hit_flash.rgb, hit_flash.a), base.a);
         return;
     }
-    vec3 n = normalize(cross(dFdx(v_world), dFdy(v_world)));
+    vec3 n = use_vertex_normal
+        ? normalize(v_normal)
+        : normalize(cross(dFdx(v_world), dFdy(v_world)));
     if (!gl_FrontFacing) n = -n;
     vec3 sun_dir = normalize(vec3(0.58, 0.56, -0.42));
     float ndl = max(dot(n, sun_dir), 0.0);
     vec3 hemi = mix(vec3(0.46, 0.37, 0.27), vec3(0.58, 0.68, 0.80), n.y * 0.5 + 0.5);
     vec3 lit = base.rgb * (hemi * 0.72 + vec3(1.12, 0.99, 0.82) * (0.20 + 0.62 * ndl));
+    if (use_vertex_normal) {
+        vec3 view_dir = normalize(cam_pos - v_world);
+        vec3 half_vec = normalize(sun_dir + view_dir);
+        float spec = pow(max(dot(n, half_vec), 0.0), 26.0) * 0.22;
+        float rim = pow(1.0 - max(dot(n, view_dir), 0.0), 3.0) * 0.10;
+        lit += vec3(1.0, 0.94, 0.84) * spec + vec3(0.86, 0.78, 0.68) * rim * base.rgb;
+    }
     if (muzzle_light > 0.001) {
         float d = length(v_world - muzzle_pos);
         float att = muzzle_light / (1.0 + d * d * 0.32);
         lit += base.rgb * vec3(1.45, 0.68, 0.22) * att;
     }
-    float dist = length(v_world - cam_pos);
-    float fog = clamp((dist - 30.0) / 88.0, 0.0, 0.54);
-    lit = mix(lit, vec3(0.89, 0.79, 0.65), fog);
+    if (!no_fog) {
+        float dist = length(v_world - cam_pos);
+        float fog = clamp((dist - 30.0) / 88.0, 0.0, 0.54);
+        lit = mix(lit, vec3(0.89, 0.79, 0.65), fog);
+    }
+    lit = mix(lit, hit_flash.rgb, hit_flash.a);
     color = vec4(lit, base.a);
 }
 "#;
@@ -294,25 +314,6 @@ const JUMP_SPEED: f32 = 6.0;
 const FIRE_COOLDOWN_MS: f64 = 500.0;
 const FALL_LIMIT: f32 = -20.0;
 
-// Exact transparent cutouts in the supplied 1536x1024 four-view image:
-// front, back, left-facing, right-facing. Coordinates are [left, top, right, bottom).
-const OPERATIVE_VIEWS: [[f32; 4]; 4] = [
-    [30.0, 51.0, 375.0, 937.0],
-    [412.0, 54.0, 745.0, 946.0],
-    [747.0, 55.0, 1135.0, 953.0],
-    [1167.0, 54.0, 1526.0, 951.0],
-];
-
-// Girls team uses the user-supplied 1448x1086 four-view image in the same
-// front/back/left/right order. Bounds are the four figure blobs detected by
-// connected-component analysis, matching how the boys views were cut.
-const GIRL_VIEWS: [[f32; 4]; 4] = [
-    [26.0, 67.0, 384.0, 991.0],
-    [392.0, 63.0, 744.0, 990.0],
-    [694.0, 73.0, 1074.0, 1004.0],
-    [1090.0, 76.0, 1431.0, 1008.0],
-];
-
 // Common monitor modes; ones larger than the monitor are hidden.
 const RESOLUTIONS: [[u32; 2]; 13] = [
     [800, 600],
@@ -341,6 +342,14 @@ macro_rules! kervan_images {
 const KERVAN_IMAGES: [&[u8]; 29] = kervan_images!(
     0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28
 );
+macro_rules! model_images {
+    ($dir:literal; $($index:literal)*) => {
+        [$(include_bytes!(concat!("../assets/", $dir, "/", $index, ".png")).as_slice()),*]
+    };
+}
+const MALE_IMAGES: [&[u8]; 4] = model_images!("male_images"; 0 1 2 3);
+const FEMALE_IMAGES: [&[u8]; 2] = model_images!("female_images"; 0 1);
+const WEAPON_IMAGES: [&[u8]; 6] = model_images!("weapon_images"; 0 1 2 3 4 5);
 
 // Minecraft Java's 0–200% slider maps to 0–1 before its cubic mouse curve.
 // Formula documented from the game's mouse path at:
@@ -434,6 +443,8 @@ struct RemotePlayer {
     deaths: u32,
     hit_at: f64,
     last_shot_at: f64,
+    walk_phase: f32,
+    move_speed: f32,
     bot_wp: usize,
     bot_fire_at: f64,
     bot_strafe: f32,
@@ -465,23 +476,106 @@ struct KervanPart {
     image: usize,
 }
 
-// A player's heading and the viewer's position select the visible side.
-// Each quarter-turn switches to one of the four supplied views.
-fn operative_view(player: &RemotePlayer, viewer: Vec3) -> usize {
-    let dx = viewer.x - player.x;
-    let dz = viewer.z - player.z;
-    let distance = (dx * dx + dz * dz).sqrt().max(0.0001);
-    let forward_x = player.yaw.cos();
-    let forward_z = player.yaw.sin();
-    let facing = (forward_x * dx + forward_z * dz) / distance;
-    if facing >= std::f32::consts::FRAC_1_SQRT_2 {
-        0
-    } else if facing <= -std::f32::consts::FRAC_1_SQRT_2 {
-        1
-    } else if forward_x * dz - forward_z * dx < 0.0 {
-        2
-    } else {
-        3
+struct ModelNode {
+    parent: Option<usize>,
+    name: String,
+    rest_t: Vec3,
+    rest_r: Quat,
+    rest_s: Vec3,
+}
+
+struct ModelPart {
+    node_idx: usize,
+    first: i32,
+    count: i32,
+    image: usize,
+}
+
+struct ArticulatedModel {
+    vao: glow::VertexArray,
+    nodes: Vec<ModelNode>,
+    parts: Vec<ModelPart>,
+    textures: Vec<glow::Texture>,
+}
+
+impl ArticulatedModel {
+    unsafe fn load(gl: &glow::Context, mesh_bin: &[u8], manifest: &str, images: &[&[u8]]) -> Self {
+        let vao = vertex_array(gl, mesh_bin, 32, &[(0, 3, 0), (1, 3, 12), (4, 2, 24)]);
+        let mut nodes = Vec::new();
+        let mut parts = Vec::new();
+        for line in manifest.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            match f.first().copied() {
+                Some("N") if f.len() >= 14 => {
+                    let parent_raw: isize = f[2].parse().unwrap();
+                    nodes.push(ModelNode {
+                        parent: (parent_raw >= 0).then_some(parent_raw as usize),
+                        name: f[3].to_owned(),
+                        rest_t: Vec3::new(
+                            f[4].parse().unwrap(),
+                            f[5].parse().unwrap(),
+                            f[6].parse().unwrap(),
+                        ),
+                        rest_r: Quat::from_xyzw(
+                            f[7].parse().unwrap(),
+                            f[8].parse().unwrap(),
+                            f[9].parse().unwrap(),
+                            f[10].parse().unwrap(),
+                        )
+                        .normalize(),
+                        rest_s: Vec3::new(
+                            f[11].parse().unwrap(),
+                            f[12].parse().unwrap(),
+                            f[13].parse().unwrap(),
+                        ),
+                    });
+                }
+                Some("P") if f.len() >= 5 => {
+                    parts.push(ModelPart {
+                        node_idx: f[1].parse().unwrap(),
+                        first: f[2].parse().unwrap(),
+                        count: f[3].parse().unwrap(),
+                        image: f[4].parse().unwrap(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        let textures = images
+            .iter()
+            .map(|png| texture(gl, png, glow::REPEAT))
+            .collect();
+        Self {
+            vao,
+            nodes,
+            parts,
+            textures,
+        }
+    }
+
+    fn node_index(&self, name: &str) -> Option<usize> {
+        self.nodes.iter().position(|n| n.name == name)
+    }
+
+    fn compute_world(&self, root: Mat4, offsets: &[(usize, Vec3, Quat, Vec3)]) -> Vec<Mat4> {
+        let mut world = vec![Mat4::IDENTITY; self.nodes.len()];
+        for (i, n) in self.nodes.iter().enumerate() {
+            let (mut dt, mut dr, mut ds) = (Vec3::ZERO, Quat::IDENTITY, Vec3::ONE);
+            for &(idx, t, r, s) in offsets {
+                if idx == i {
+                    dt += t;
+                    dr *= r;
+                    ds *= s;
+                }
+            }
+            let local =
+                Mat4::from_scale_rotation_translation(n.rest_s * ds, n.rest_r * dr, n.rest_t + dt);
+            world[i] = match n.parent {
+                Some(p) => world[p] * local,
+                None => root * local,
+            };
+        }
+        world
     }
 }
 
@@ -497,7 +591,10 @@ struct Game {
     transform: glow::UniformLocation,
     model_loc: glow::UniformLocation,
     texture_enabled: glow::UniformLocation,
+    use_vnormal_loc: glow::UniformLocation,
     unlit_loc: glow::UniformLocation,
+    no_fog_loc: glow::UniformLocation,
+    hit_flash_loc: glow::UniformLocation,
     cam_pos_loc: glow::UniformLocation,
     muzzle_pos_loc: glow::UniformLocation,
     muzzle_light_loc: glow::UniformLocation,
@@ -508,14 +605,9 @@ struct Game {
     sky_fov_loc: glow::UniformLocation,
     sprite_program: glow::Program,
     sprite_vao: glow::VertexArray,
-    operative_vaos: Vec<glow::VertexArray>,
-    girl_vaos: Vec<glow::VertexArray>,
-    sprite_transform: glow::UniformLocation,
-    sprite_tint: glow::UniformLocation,
-    sprite_flash: glow::UniformLocation,
-    textures: [glow::Texture; 3],
-    operative_texture: glow::Texture,
-    girl_texture: glow::Texture,
+    male_model: ArticulatedModel,
+    female_model: ArticulatedModel,
+    weapon_model: ArticulatedModel,
     // The scene is drawn here at the chosen resolution, then stretched to the window.
     framebuffer: glow::Framebuffer,
     color: glow::Texture,
@@ -688,13 +780,35 @@ impl Game {
             );
             let sprite_vao =
                 vertex_array(&gl, &floats(&SPRITE_VERTICES), 16, &[(0, 2, 0), (4, 2, 8)]);
-            let weapon = |png| texture(&gl, png, glow::CLAMP_TO_EDGE);
+            let male_model = ArticulatedModel::load(
+                &gl,
+                include_bytes!("../assets/male_mesh.bin"),
+                include_str!("../assets/male_nodes.txt"),
+                &MALE_IMAGES,
+            );
+            let female_model = ArticulatedModel::load(
+                &gl,
+                include_bytes!("../assets/female_mesh.bin"),
+                include_str!("../assets/female_nodes.txt"),
+                &FEMALE_IMAGES,
+            );
+            let weapon_model = ArticulatedModel::load(
+                &gl,
+                include_bytes!("../assets/weapon_mesh.bin"),
+                include_str!("../assets/weapon_nodes.txt"),
+                &WEAPON_IMAGES,
+            );
             Game {
                 ctx: ctx.clone(),
                 transform: gl.get_uniform_location(program, "MVP").unwrap(),
                 model_loc: gl.get_uniform_location(program, "MODEL").unwrap(),
                 texture_enabled: gl.get_uniform_location(program, "use_texture").unwrap(),
+                use_vnormal_loc: gl
+                    .get_uniform_location(program, "use_vertex_normal")
+                    .unwrap(),
                 unlit_loc: gl.get_uniform_location(program, "unlit").unwrap(),
+                no_fog_loc: gl.get_uniform_location(program, "no_fog").unwrap(),
+                hit_flash_loc: gl.get_uniform_location(program, "hit_flash").unwrap(),
                 cam_pos_loc: gl.get_uniform_location(program, "cam_pos").unwrap(),
                 muzzle_pos_loc: gl.get_uniform_location(program, "muzzle_pos").unwrap(),
                 muzzle_light_loc: gl.get_uniform_location(program, "muzzle_light").unwrap(),
@@ -705,9 +819,6 @@ impl Game {
                 sky_fov_loc: gl
                     .get_uniform_location(sky_program, "tan_half_fov")
                     .unwrap(),
-                sprite_transform: gl.get_uniform_location(sprite_program, "MVP").unwrap(),
-                sprite_tint: gl.get_uniform_location(sprite_program, "tint").unwrap(),
-                sprite_flash: gl.get_uniform_location(sprite_program, "flash").unwrap(),
                 program,
                 sky_program,
                 vao,
@@ -719,15 +830,9 @@ impl Game {
                     .collect(),
                 sprite_program,
                 sprite_vao,
-                operative_vaos: operative_vaos(&gl, &OPERATIVE_VIEWS, 1536.0, 1024.0),
-                girl_vaos: operative_vaos(&gl, &GIRL_VIEWS, 1448.0, 1086.0),
-                textures: [
-                    weapon(include_bytes!("../assets/weapon_idle.png")),
-                    weapon(include_bytes!("../assets/weapon_flash.png")),
-                    weapon(include_bytes!("../assets/weapon_recoil.png")),
-                ],
-                operative_texture: weapon(include_bytes!("../assets/operative_turnaround.png")),
-                girl_texture: weapon(include_bytes!("../assets/girl_turnaround.png")),
+                male_model,
+                female_model,
+                weapon_model,
                 framebuffer: gl.create_framebuffer().expect("No framebuffer"),
                 color: gl.create_texture().expect("No scene texture"),
                 depth: gl.create_renderbuffer().expect("No depth buffer"),
@@ -989,6 +1094,8 @@ impl Game {
                     deaths: 0,
                     hit_at: f64::NEG_INFINITY,
                     last_shot_at: f64::NEG_INFINITY,
+                    walk_phase: id as f32 * 1.1,
+                    move_speed: 0.0,
                     bot_wp: wp,
                     bot_fire_at: self.last_frame + delay,
                     bot_strafe: strafe,
@@ -2023,6 +2130,8 @@ impl Game {
                             },
                             hit_at: f64::NEG_INFINITY,
                             last_shot_at: f64::NEG_INFINITY,
+                            walk_phase: id as f32 * 0.9,
+                            move_speed: 0.0,
                             bot_wp: 0,
                             bot_fire_at: f64::NEG_INFINITY,
                             bot_strafe: 1.0,
@@ -2148,6 +2257,11 @@ impl Game {
     fn draw(&mut self, now: f64, [width, height]: [u32; 2]) -> bool {
         let dt = ((now - self.last_draw) / 1000.0).clamp(0.0, 0.05) as f32;
         self.last_frame = now;
+        let prev_pos: HashMap<u32, (f32, f32)> = self
+            .remote
+            .iter()
+            .map(|(&id, p)| (id, (p.x, p.z)))
+            .collect();
         if self.mode == Mode::Practice {
             self.step_practice(dt, now);
         } else {
@@ -2155,6 +2269,17 @@ impl Game {
             for player in self.remote.values_mut() {
                 let eased = Vec3::new(player.x, player.y, player.z).lerp(player.target, blend);
                 (player.x, player.y, player.z) = (eased.x, eased.y, eased.z);
+            }
+        }
+        if dt > 0.0001 {
+            let smooth = (dt * 10.0).min(1.0);
+            for (&id, player) in self.remote.iter_mut() {
+                let (px, pz) = prev_pos.get(&id).copied().unwrap_or((player.x, player.z));
+                let inst_speed = ((player.x - px).hypot(player.z - pz) / dt).min(6.0);
+                player.move_speed += (inst_speed - player.move_speed) * smooth;
+                if player.move_speed > 0.15 {
+                    player.walk_phase += player.move_speed * dt * 2.55;
+                }
             }
         }
         let backdrop = matches!(
@@ -2442,7 +2567,10 @@ impl Game {
             );
             gl.uniform_1_f32(Some(&self.muzzle_light_loc), muzzle_light);
             gl.uniform_1_i32(Some(&self.texture_enabled), 0);
+            gl.uniform_1_i32(Some(&self.use_vnormal_loc), 0);
             gl.uniform_1_i32(Some(&self.unlit_loc), 0);
+            gl.uniform_1_i32(Some(&self.no_fog_loc), 0);
+            gl.uniform_4_f32(Some(&self.hit_flash_loc), 0.0, 0.0, 0.0, 0.0);
             gl.bind_vertex_array(Some(self.vao));
             for block in map::blocks(self.map) {
                 let position = Vec3::from_array(block.center);
@@ -2585,7 +2713,7 @@ impl Game {
                 let db = (b.x - self.position.x).powi(2) + (b.z - self.position.z).powi(2);
                 db.total_cmp(&da)
             });
-            // Soft contact shadows under players so sprites feel planted on the desert floor.
+            // Soft contact shadows under 3D characters.
             for player in &players {
                 let model = Mat4::from_translation(Vec3::new(player.x, player.y + 0.03, player.z))
                     * Mat4::from_scale(Vec3::new(0.42, 0.01, 0.42));
@@ -2598,102 +2726,248 @@ impl Game {
                 gl.vertex_attrib_4_f32(3, 0.05, 0.04, 0.03, 0.42);
                 gl.draw_elements(glow::TRIANGLES, 36, glow::UNSIGNED_SHORT, 0);
             }
-
-            gl.use_program(Some(self.sprite_program));
-            for player in players {
-                let (texture, vaos, views) = match player.team {
-                    Team::Boys => (
-                        self.operative_texture,
-                        &self.operative_vaos,
-                        &OPERATIVE_VIEWS,
-                    ),
-                    Team::Girls => (self.girl_texture, &self.girl_vaos, &GIRL_VIEWS),
-                };
-                let view_index = operative_view(player, cam_pos);
-                let crop = views[view_index];
-                let half_width = 0.95 * (crop[2] - crop[0]) / (crop[3] - crop[1]);
-                let facing_viewer = (cam_pos.x - player.x).atan2(cam_pos.z - player.z);
-                let model = Mat4::from_translation(Vec3::new(player.x, player.y + 0.95, player.z))
-                    * Mat4::from_rotation_y(facing_viewer)
-                    * Mat4::from_scale(Vec3::new(half_width, 0.95, 1.0));
-                let dist = Vec3::new(player.x, player.y + 1.0, player.z).distance(cam_pos);
-                let fog = ((dist - 24.0) / 76.0).clamp(0.0, 0.48);
-                let hit_fade = ((135.0 - (now - player.hit_at)) / 135.0).clamp(0.0, 1.0) as f32;
-                let shot_glow =
-                    ((90.0 - (now - player.last_shot_at)) / 90.0).clamp(0.0, 1.0) as f32;
-                gl.uniform_4_f32(
-                    Some(&self.sprite_tint),
-                    1.02 + shot_glow * 0.25,
-                    0.98 + shot_glow * 0.12,
-                    0.92,
-                    1.0,
-                );
-                if hit_fade > 0.01 {
-                    gl.uniform_4_f32(Some(&self.sprite_flash), 1.0, 0.45, 0.30, hit_fade * 0.72);
-                } else {
-                    gl.uniform_4_f32(Some(&self.sprite_flash), 0.89, 0.79, 0.65, fog * 0.55);
-                }
-                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-                gl.bind_vertex_array(Some(vaos[view_index]));
-                gl.uniform_matrix_4_f32_slice(
-                    Some(&self.sprite_transform),
-                    false,
-                    &(vp * model).to_cols_array(),
-                );
-                gl.draw_arrays(glow::TRIANGLES, 0, 6);
-            }
             gl.disable(glow::BLEND);
             gl.depth_mask(true);
 
-            gl.disable(glow::DEPTH_TEST);
-            if !backdrop {
-                let since_shot = now - self.shot_at;
-                let frame = if since_shot < 95.0 {
-                    1
-                } else if since_shot < 210.0 {
-                    2
-                } else {
-                    0
+            // Articulated 3D animated characters (Boys = Male Operative, Girls = Female Operative).
+            gl.uniform_1_i32(Some(&self.texture_enabled), 1);
+            gl.uniform_1_i32(Some(&self.use_vnormal_loc), 1);
+            gl.uniform_1_i32(Some(&self.unlit_loc), 0);
+            gl.uniform_1_i32(Some(&self.no_fog_loc), 0);
+            let mut anim_offsets: Vec<(usize, Vec3, Quat, Vec3)> = Vec::with_capacity(12);
+            for player in &players {
+                let model = match player.team {
+                    Team::Boys => &self.male_model,
+                    Team::Girls => &self.female_model,
                 };
-                let (aspect_w, sight_x) = match frame {
-                    0 => (1.5, 768.0 / 1536.0),
-                    1 => (1.0, 630.0 / 1254.0),
-                    _ => (1.0, 665.0 / 1254.0),
+                let run = (player.move_speed / 3.4).clamp(0.0, 1.0);
+                let s = player.walk_phase.sin();
+                let c = player.walk_phase.cos();
+                let breath = ((now * 0.0024) as f32 + player.x).sin() * 0.018 * (1.0 - run);
+                let hit_fade = ((140.0 - (now - player.hit_at)) / 140.0).clamp(0.0, 1.0) as f32;
+                let shot_kick =
+                    ((120.0 - (now - player.last_shot_at)) / 120.0).clamp(0.0, 1.0) as f32;
+
+                anim_offsets.clear();
+                let mut push_anim = |name: &str, t: Vec3, r: Quat| {
+                    if let Some(idx) = model.node_index(name) {
+                        anim_offsets.push((idx, t, r, Vec3::ONE));
+                    }
                 };
-                let kick = if (0.0..260.0).contains(&since_shot) {
-                    (1.0 - (since_shot as f32 / 260.0)).powi(2)
+                push_anim(
+                    "pelvis",
+                    Vec3::new(0.0, s.abs() * 0.042 * run, 0.0),
+                    Quat::from_rotation_y(s * 0.12 * run),
+                );
+                push_anim(
+                    "torso",
+                    Vec3::ZERO,
+                    Quat::from_rotation_y(-s * 0.14 * run)
+                        * Quat::from_rotation_x(
+                            0.05 * run + breath - shot_kick * 0.09 - hit_fade * 0.16,
+                        ),
+                );
+                push_anim(
+                    "head",
+                    Vec3::ZERO,
+                    Quat::from_rotation_y(s * 0.08 * run)
+                        * Quat::from_rotation_x(-breath * 0.5 + hit_fade * 0.12),
+                );
+                push_anim(
+                    "ponytail",
+                    Vec3::ZERO,
+                    Quat::from_rotation_x((0.14 + s.abs() * 0.28) * run)
+                        * Quat::from_rotation_y(-s * 0.24 * run),
+                );
+                push_anim(
+                    "rifle",
+                    Vec3::new(0.0, 0.0, -shot_kick * 0.045),
+                    Quat::from_rotation_x(-shot_kick * 0.09)
+                        * Quat::from_rotation_z(s * 0.03 * run),
+                );
+                push_anim(
+                    "upper_arm_l",
+                    Vec3::ZERO,
+                    Quat::from_rotation_x(-shot_kick * 0.06),
+                );
+                push_anim(
+                    "upper_arm_r",
+                    Vec3::ZERO,
+                    Quat::from_rotation_x(-shot_kick * 0.08),
+                );
+                push_anim(
+                    "thigh_l",
+                    Vec3::ZERO,
+                    Quat::from_rotation_x(-s * 0.58 * run),
+                );
+                push_anim(
+                    "shin_l",
+                    Vec3::ZERO,
+                    Quat::from_rotation_x((0.06 + c.max(0.0) * 0.78 + (-s).max(0.0) * 0.20) * run),
+                );
+                push_anim(
+                    "foot_l",
+                    Vec3::ZERO,
+                    Quat::from_rotation_x((-s * 0.20 - c.max(0.0) * 0.26) * run),
+                );
+                push_anim("thigh_r", Vec3::ZERO, Quat::from_rotation_x(s * 0.58 * run));
+                push_anim(
+                    "shin_r",
+                    Vec3::ZERO,
+                    Quat::from_rotation_x((0.06 + (-c).max(0.0) * 0.78 + s.max(0.0) * 0.20) * run),
+                );
+                push_anim(
+                    "foot_r",
+                    Vec3::ZERO,
+                    Quat::from_rotation_x((s * 0.20 - (-c).max(0.0) * 0.26) * run),
+                );
+
+                let root = Mat4::from_translation(Vec3::new(player.x, player.y, player.z))
+                    * Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2 - player.yaw);
+                let mats = model.compute_world(root, &anim_offsets);
+                let flash_a = if hit_fade > 0.01 {
+                    hit_fade * 0.65
                 } else {
                     0.0
                 };
-                let bob_x = self.bob_phase.cos() * 0.024 * self.bob_amount;
-                let bob_y = (self.bob_phase * 2.0).sin().abs() * -0.022 * self.bob_amount;
-                let sy = [0.65, 0.69, 0.66][frame] * (1.0 + kick * 0.04);
-                let sx = sy * aspect_w * height as f32 / width as f32;
-                let tx = (0.5 - sight_x) * 2.0 * sx + bob_x + self.weapon_sway.x;
-                let ty = -1.0 + sy + bob_y + self.weapon_sway.y - self.land_dip * 0.8 - kick * 0.06;
-                let weapon = Mat4::from_translation(Vec3::new(tx, ty, 0.0))
-                    * Mat4::from_rotation_z(-self.weapon_sway.x * 0.55 + kick * 0.03)
-                    * Mat4::from_scale(Vec3::new(sx, sy, 1.0));
-                gl.enable(glow::BLEND);
-                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
-                gl.use_program(Some(self.sprite_program));
-                gl.uniform_4_f32(
-                    Some(&self.sprite_tint),
-                    1.0 + muzzle_light * 0.14,
-                    0.99 + muzzle_light * 0.06,
-                    0.96,
+                gl.uniform_4_f32(Some(&self.hit_flash_loc), 1.0, 0.35, 0.25, flash_a);
+                gl.vertex_attrib_4_f32(3, 1.0 + shot_kick * 0.22, 1.0 + shot_kick * 0.12, 1.0, 1.0);
+                gl.bind_vertex_array(Some(model.vao));
+                for part in &model.parts {
+                    let m = mats[part.node_idx];
+                    gl.uniform_matrix_4_f32_slice(
+                        Some(&self.transform),
+                        false,
+                        &(vp * m).to_cols_array(),
+                    );
+                    gl.uniform_matrix_4_f32_slice(Some(&self.model_loc), false, &m.to_cols_array());
+                    gl.bind_texture(glow::TEXTURE_2D, Some(model.textures[part.image]));
+                    gl.draw_arrays(glow::TRIANGLES, part.first, part.count);
+                }
+
+                // Bright 3D muzzle spark when remote player/bot fires.
+                if now - player.last_shot_at < 75.0 {
+                    let fwd_p = Vec3::new(player.yaw.cos(), 0.0, player.yaw.sin());
+                    let muzzle = Vec3::new(player.x, player.y + 1.37, player.z) + fwd_p * 0.82;
+                    let m = Mat4::from_translation(muzzle)
+                        * Mat4::from_rotation_y(player.yaw + now as f32 * 0.05)
+                        * Mat4::from_scale(Vec3::splat(0.11));
+                    gl.bind_vertex_array(Some(self.vao));
+                    gl.uniform_1_i32(Some(&self.texture_enabled), 0);
+                    gl.uniform_1_i32(Some(&self.use_vnormal_loc), 0);
+                    gl.uniform_1_i32(Some(&self.unlit_loc), 1);
+                    gl.uniform_4_f32(Some(&self.hit_flash_loc), 0.0, 0.0, 0.0, 0.0);
+                    gl.uniform_matrix_4_f32_slice(
+                        Some(&self.transform),
+                        false,
+                        &(vp * m).to_cols_array(),
+                    );
+                    gl.uniform_matrix_4_f32_slice(Some(&self.model_loc), false, &m.to_cols_array());
+                    gl.vertex_attrib_4_f32(3, 1.0, 0.82, 0.32, 1.0);
+                    gl.draw_elements(glow::TRIANGLES, 36, glow::UNSIGNED_SHORT, 0);
+                    gl.uniform_1_i32(Some(&self.texture_enabled), 1);
+                    gl.uniform_1_i32(Some(&self.use_vnormal_loc), 1);
+                    gl.uniform_1_i32(Some(&self.unlit_loc), 0);
+                }
+            }
+
+            // Hero 3D First-Person AK-47 Viewmodel (camera-space depth pass so it never clips walls).
+            if !backdrop {
+                gl.clear(glow::DEPTH_BUFFER_BIT);
+                gl.enable(glow::DEPTH_TEST);
+                gl.depth_mask(true);
+                let since_shot = now - self.shot_at;
+                let kick = if (0.0..240.0).contains(&since_shot) {
+                    (1.0 - (since_shot as f32 / 240.0)).powi(2)
+                } else {
+                    0.0
+                };
+                let bolt_t = if (0.0..130.0).contains(&since_shot) {
+                    ((since_shot as f32 / 130.0) * std::f32::consts::PI).sin()
+                } else {
+                    0.0
+                };
+                let show_flash = (0.0..80.0).contains(&since_shot);
+                let bob_x = self.bob_phase.cos() * 0.013 * self.bob_amount;
+                let bob_y = -(self.bob_phase * 2.0).sin().abs() * 0.011 * self.bob_amount;
+                let idle_b = (now * 0.0022) as f32;
+                let idle_y = idle_b.sin() * 0.0022 * (1.0 - self.bob_amount);
+                let w_tx = bob_x + self.weapon_sway.x * 0.16;
+                let w_ty = bob_y + idle_y + self.weapon_sway.y * 0.12 - self.land_dip * 0.25;
+                let w_tz = 0.035 + kick * 0.055;
+                let w_rot = Quat::from_rotation_y(-self.weapon_sway.x * 0.48)
+                    * Quat::from_rotation_x(self.weapon_sway.y * 0.36 + kick * 0.09)
+                    * Quat::from_rotation_z(
+                        -self.strafe_roll * 1.35 - self.weapon_sway.x * 0.40 + kick * 0.032,
+                    );
+                let weapon_root =
+                    Mat4::from_translation(Vec3::new(w_tx, w_ty, w_tz)) * Mat4::from_quat(w_rot);
+                let weapon_proj = camera::rh::proj::opengl::perspective(
+                    (58.0 + self.fov_kick * 0.5).to_radians(),
+                    aspect,
+                    0.02,
+                    8.0,
+                );
+                let cam_to_world = view.inverse();
+                let mut w_offsets = Vec::with_capacity(2);
+                if let Some(bc) = self.weapon_model.node_index("bolt_carrier") {
+                    w_offsets.push((
+                        bc,
+                        Vec3::new(0.0, 0.0, bolt_t * 0.085),
+                        Quat::IDENTITY,
+                        Vec3::ONE,
+                    ));
+                }
+                let flash_idx = self.weapon_model.node_index("muzzle_flash");
+                if let (Some(mf), true) = (flash_idx, show_flash) {
+                    let f_scale = 0.85 + (1.0 - (since_shot as f32 / 80.0)) * 0.35;
+                    w_offsets.push((
+                        mf,
+                        Vec3::ZERO,
+                        Quat::from_rotation_z((self.shot_at * 0.037) as f32),
+                        Vec3::splat(f_scale),
+                    ));
+                }
+                let mats = self.weapon_model.compute_world(weapon_root, &w_offsets);
+                gl.bind_vertex_array(Some(self.weapon_model.vao));
+                gl.uniform_1_i32(Some(&self.texture_enabled), 1);
+                gl.uniform_1_i32(Some(&self.use_vnormal_loc), 1);
+                gl.uniform_1_i32(Some(&self.no_fog_loc), 1);
+                gl.uniform_4_f32(Some(&self.hit_flash_loc), 0.0, 0.0, 0.0, 0.0);
+                gl.vertex_attrib_4_f32(
+                    3,
+                    1.02 + muzzle_light * 0.14,
+                    1.01 + muzzle_light * 0.06,
+                    1.0,
                     1.0,
                 );
-                gl.uniform_4_f32(Some(&self.sprite_flash), 0.0, 0.0, 0.0, 0.0);
-                gl.bind_vertex_array(Some(self.sprite_vao));
-                gl.bind_texture(glow::TEXTURE_2D, Some(self.textures[frame]));
-                gl.uniform_matrix_4_f32_slice(
-                    Some(&self.sprite_transform),
-                    false,
-                    &weapon.to_cols_array(),
-                );
-                gl.draw_arrays(glow::TRIANGLES, 0, 6);
-                gl.disable(glow::BLEND);
+                for part in &self.weapon_model.parts {
+                    let is_flash = flash_idx == Some(part.node_idx);
+                    if is_flash && !show_flash {
+                        continue;
+                    }
+                    let cam_m = mats[part.node_idx];
+                    let world_m = cam_to_world * cam_m;
+                    gl.uniform_1_i32(Some(&self.unlit_loc), i32::from(is_flash));
+                    gl.uniform_matrix_4_f32_slice(
+                        Some(&self.transform),
+                        false,
+                        &(weapon_proj * cam_m).to_cols_array(),
+                    );
+                    gl.uniform_matrix_4_f32_slice(
+                        Some(&self.model_loc),
+                        false,
+                        &world_m.to_cols_array(),
+                    );
+                    gl.bind_texture(
+                        glow::TEXTURE_2D,
+                        Some(self.weapon_model.textures[part.image]),
+                    );
+                    gl.draw_arrays(glow::TRIANGLES, part.first, part.count);
+                }
+                gl.uniform_1_i32(Some(&self.unlit_loc), 0);
+                gl.uniform_1_i32(Some(&self.no_fog_loc), 0);
+                gl.uniform_1_i32(Some(&self.use_vnormal_loc), 0);
             }
             gl.bind_vertex_array(None);
             gl.use_program(None);
@@ -3021,25 +3295,6 @@ unsafe fn vertex_array(
         gl.enable_vertex_attrib_array(location);
     }
     vao
-}
-
-unsafe fn operative_vaos(
-    gl: &glow::Context,
-    views: &[[f32; 4]; 4],
-    width: f32,
-    height: f32,
-) -> Vec<glow::VertexArray> {
-    views
-        .iter()
-        .map(|&[left, top, right, bottom]| {
-            let (u0, v0, u1, v1) = (left / width, top / height, right / width, bottom / height);
-            let quad = [
-                -1.0, -1.0, u0, v1, 1.0, -1.0, u1, v1, 1.0, 1.0, u1, v0, -1.0, -1.0, u0, v1, 1.0,
-                1.0, u1, v0, -1.0, 1.0, u0, v0,
-            ];
-            vertex_array(gl, &floats(&quad), 16, &[(0, 2, 0), (4, 2, 8)])
-        })
-        .collect()
 }
 
 // Adapted from wasm-bindgen/examples/webgl/src/lib.rs, lines 89-134.
